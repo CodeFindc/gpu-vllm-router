@@ -1,0 +1,34 @@
+# GPUStack 集群连接配置
+gpustack:
+  base_url: "http://<GPUSTACK_HOST>:8200"
+  username: "admin"
+  password: "your_password_here"
+  api_key: ""
+  timeout: 10s
+
+# 模型与调度配置
+target:
+  # 留空代表开启【全集群多模型自动同步】，自动纳管并路由 GPUStack 上的所有模型！
+  # 也可以填写指定模型名称（如 "DeepSeek-V4-Flash-0731-w8a8"）开启单模型定向路由
+  model_name: ""
+  # 可选策略:
+  # - consistent_hash: 一致性哈希，多轮对话上下文与 KV Cache 复用（根据 X-Session-ID / X-User-ID / session_id）
+  # - cache_aware:     前缀缓存感知优化路由（vLLM 官方推荐）
+  # - round_robin:     均匀轮询
+  # - power_of_two:    P2C 算法，选取活跃连接数较低的节点
+  # - random:          随机路由
+  # - rendezvous_hash: 最高随机权重哈希
+  policy: "consistent_hash"
+
+# 路由器服务配置
+router:
+  # 运行模式: cmd | proxy | run
+  mode: "cmd"
+  host: "0.0.0.0"
+  port: 8000
+  router_bin: "vllm-router"
+  watch_interval: 10s
+  data_parallel_size: 1
+  # run 模式蓝绿无损热重载配置
+  zero_downtime: true
+  drain_timeout: 60s

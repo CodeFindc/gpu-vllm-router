@@ -1,0 +1,190 @@
+package router
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestGetFreePort(t *testing.T) {
+	port, err := getFreePort()
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	if port <= 1024 || port > 65535 {
+		t.Errorf("unexpected port number: %d", port)
+	}
+}
+
+func TestSupervisorHealthCheck(t *testing.T) {
+	// Mock backend that starts unhealthy then becomes healthy
+	isHealthy := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			if isHealthy {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"status":"ok"}`))
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	portStr := u.Port()
+	port, _ := strconv.Atoi(portStr)
+
+	sup := &Supervisor{}
+
+	// Initially unhealthy, should timeout quickly
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := sup.waitForHealth(ctx, port, 400*time.Millisecond)
+	if err == nil {
+		t.Error("expected health check to fail when unhealthy")
+	}
+
+	// Now make it healthy
+	isHealthy = true
+	ctx2 := context.Background()
+	err2 := sup.waitForHealth(ctx2, port, 1*time.Second)
+	if err2 != nil {
+		t.Errorf("expected health check to pass, got: %v", err2)
+	}
+}
+
+func TestZeroDowntimeTargetSwitch(t *testing.T) {
+	sup := &Supervisor{}
+
+	targetA, _ := url.Parse("http://127.0.0.1:18001")
+	targetB, _ := url.Parse("http://127.0.0.1:18002")
+
+	sup.activeTarget = targetA
+
+	req, _ := http.NewRequest(http.MethodGet, "http://0.0.0.0:8000/v1/models", nil)
+
+	// Simulate reverse proxy director reading target
+	sup.mu.RLock()
+	target := sup.activeTarget
+	sup.mu.RUnlock()
+
+	req.URL.Host = target.Host
+	if !strings.Contains(req.URL.Host, "18001") {
+		t.Errorf("expected host 18001, got %s", req.URL.Host)
+	}
+
+	// Atomic switch to targetB
+	sup.mu.Lock()
+	sup.activeTarget = targetB
+	sup.mu.Unlock()
+
+	sup.mu.RLock()
+	newTarget := sup.activeTarget
+	sup.mu.RUnlock()
+
+	req.URL.Host = newTarget.Host
+	if !strings.Contains(req.URL.Host, "18002") {
+		t.Errorf("expected host 18002, got %s", req.URL.Host)
+	}
+}
+
+func TestSupervisorMultiModelRouting(t *testing.T) {
+	// 1. Setup Mock Router Processes for Model A and Model B
+	serverAHits := 0
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverAHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"reply":"from_model_a"}`))
+	}))
+	defer serverA.Close()
+
+	serverBHits := 0
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		serverBHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"reply":"from_model_b"}`))
+	}))
+	defer serverB.Close()
+
+	targetA, _ := url.Parse(serverA.URL)
+	targetB, _ := url.Parse(serverB.URL)
+
+	sup := &Supervisor{
+		runners: map[string]*ModelRunner{
+			"DeepSeek-V4-Flash-0731-w8a8": {
+				ModelName:    "DeepSeek-V4-Flash-0731-w8a8",
+				ActiveTarget: targetA,
+				ActiveURLs:   []string{"http://192.168.1.10:40039"},
+			},
+			"Qwen3.6-27B": {
+				ModelName:    "Qwen3.6-27B",
+				ActiveTarget: targetB,
+				ActiveURLs:   []string{"http://192.168.1.11:40039"},
+			},
+		},
+	}
+
+	// 2. Test /health
+	rwHealth := httptest.NewRecorder()
+	reqHealth, _ := http.NewRequest(http.MethodGet, "/health", nil)
+	sup.handleHealth(rwHealth, reqHealth)
+	if rwHealth.Code != http.StatusOK {
+		t.Errorf("expected /health 200, got %d", rwHealth.Code)
+	}
+
+	// 3. Test /v1/models
+	rwModels := httptest.NewRecorder()
+	reqModels, _ := http.NewRequest(http.MethodGet, "/v1/models", nil)
+	sup.handleModels(rwModels, reqModels)
+	if rwModels.Code != http.StatusOK {
+		t.Errorf("expected /v1/models 200, got %d", rwModels.Code)
+	}
+	modelsBody := rwModels.Body.String()
+	if !strings.Contains(modelsBody, "DeepSeek-V4-Flash") || !strings.Contains(modelsBody, "Qwen3.6-27B") {
+		t.Errorf("expected both models in /v1/models, got: %s", modelsBody)
+	}
+
+	// 4. Test Routing to Model A
+	rwReqA := httptest.NewRecorder()
+	reqBodyA := strings.NewReader(`{"model":"DeepSeek-V4-Flash-0731-w8a8","messages":[{"role":"user","content":"hi"}]}`)
+	reqA, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", reqBodyA)
+	sup.handleProxy(rwReqA, reqA)
+	if rwReqA.Code != http.StatusOK {
+		t.Errorf("expected 200 for model A, got %d (body: %s)", rwReqA.Code, rwReqA.Body.String())
+	}
+	if serverAHits != 1 || serverBHits != 0 {
+		t.Errorf("expected serverA hit=1, got A=%d, B=%d", serverAHits, serverBHits)
+	}
+
+	// 5. Test Routing to Model B (case-insensitive substring)
+	rwReqB := httptest.NewRecorder()
+	reqBodyB := strings.NewReader(`{"model":"qwen3.6","messages":[{"role":"user","content":"hi"}]}`)
+	reqB, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", reqBodyB)
+	sup.handleProxy(rwReqB, reqB)
+	if rwReqB.Code != http.StatusOK {
+		t.Errorf("expected 200 for model B, got %d", rwReqB.Code)
+	}
+	if serverBHits != 1 {
+		t.Errorf("expected serverB hit=1, got %d", serverBHits)
+	}
+
+	// 6. Test Unknown Model Returns 404
+	rwUnknown := httptest.NewRecorder()
+	reqBodyUnknown := strings.NewReader(`{"model":"NonExistentModel"}`)
+	reqUnknown, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", reqBodyUnknown)
+	sup.handleProxy(rwUnknown, reqUnknown)
+	if rwUnknown.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown model, got %d", rwUnknown.Code)
+	}
+}
+
