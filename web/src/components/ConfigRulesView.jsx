@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 
 const POLICY_OPTIONS = [
   { value: 'consistent_hash', label: '一致性哈希 (consistent_hash) - 会话保持，高 Cache 命中率' },
+  { value: 'cache_aware', label: '前缀缓存感知 (cache_aware) - KV Cache 前缀复用优化，高重合度最佳' },
+  { value: 'rendezvous_hash', label: '最高随机权重哈希 (rendezvous_hash) - HRW 算法，分布式最小迁移' },
   { value: 'round_robin', label: '轮询分发 (round_robin) - 请求均匀分散' },
   { value: 'power_of_two', label: '最小负载选择 (power_of_two) - P2C 双候选低延迟感知' },
   { value: 'random', label: '随机分发 (random) - 无状态快速打散' },
@@ -21,6 +23,12 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
   const [watchInterval, setWatchInterval] = useState(10);
   const [zeroDowntime, setZeroDowntime] = useState(true);
   const [drainTimeout, setDrainTimeout] = useState(60);
+
+  // Official vllm-router Tuning State (Run Mode)
+  const [balanceAbsThreshold, setBalanceAbsThreshold] = useState(4);
+  const [balanceRelThreshold, setBalanceRelThreshold] = useState(1.1);
+  const [cacheThreshold, setCacheThreshold] = useState(0.6);
+  const [extraArgs, setExtraArgs] = useState('');
 
   // Circuit Breaker State
   const [cbEnabled, setCbEnabled] = useState(true);
@@ -55,6 +63,11 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
         setWatchInterval(data.watch_interval_secs || 10);
         setZeroDowntime(data.zero_downtime !== false);
         setDrainTimeout(data.drain_timeout_secs || 60);
+
+        setBalanceAbsThreshold(data.balance_abs_threshold !== undefined && data.balance_abs_threshold !== null ? data.balance_abs_threshold : 4);
+        setBalanceRelThreshold(data.balance_rel_threshold !== undefined && data.balance_rel_threshold !== null ? data.balance_rel_threshold : 1.1);
+        setCacheThreshold(data.cache_threshold !== undefined && data.cache_threshold !== null ? data.cache_threshold : 0.6);
+        setExtraArgs(Array.isArray(data.extra_args) ? data.extra_args.join(' ') : (data.extra_args || ''));
 
         setCbEnabled(data.circuit_breaker_enabled !== false);
         setCbMaxFailures(data.max_failures || 3);
@@ -148,12 +161,18 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
         policy: modelRules[name].policy,
       }));
 
+      const parsedExtraArgs = extraArgs && extraArgs.trim() ? extraArgs.trim().split(/\s+/) : [];
+
       const payload = {
         mode: globalMode,
         policy: globalPolicy,
         watch_interval_secs: parseInt(watchInterval, 10),
         zero_downtime: zeroDowntime,
         drain_timeout_secs: parseInt(drainTimeout, 10),
+        balance_abs_threshold: parseInt(balanceAbsThreshold, 10),
+        balance_rel_threshold: parseFloat(balanceRelThreshold),
+        cache_threshold: parseFloat(cacheThreshold),
+        extra_args: parsedExtraArgs,
         circuit_breaker_enabled: cbEnabled,
         max_failures: parseInt(cbMaxFailures, 10),
         cooldown_secs: parseInt(cbCooldown, 10),
@@ -194,6 +213,25 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
       `  watch_interval: "${watchInterval}s"`,
       `  zero_downtime: ${zeroDowntime}`,
       `  drain_timeout: "${drainTimeout}s"`,
+    ];
+
+    if (balanceAbsThreshold > 0) {
+      lines.push(`  balance_abs_threshold: ${balanceAbsThreshold}`);
+    }
+    if (balanceRelThreshold > 0) {
+      lines.push(`  balance_rel_threshold: ${balanceRelThreshold}`);
+    }
+    if (cacheThreshold > 0) {
+      lines.push(`  cache_threshold: ${cacheThreshold}`);
+    }
+    if (extraArgs && extraArgs.trim()) {
+      lines.push('  extra_args:');
+      extraArgs.trim().split(/\s+/).forEach((arg) => {
+        lines.push(`    - "${arg}"`);
+      });
+    }
+
+    lines.push(
       '',
       'target:',
       `  policy: "${globalPolicy}"`,
@@ -207,7 +245,7 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
       `  success_threshold: ${cbSuccessThreshold}`,
       '',
       'models:',
-    ];
+    );
 
     const modelKeys = Object.keys(modelRules);
     if (modelKeys.length === 0) {
@@ -499,6 +537,86 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
             </div>
           </div>
         </section>
+
+        {/* Card 3: Official vllm-router Tuning Parameters */}
+        <section className="glass-panel" style={{ gridColumn: '1 / -1' }}>
+          <div className="panel-header">
+            <div className="panel-title">
+              <span>🚀</span>
+              <span>官方 vllm-router 专项微调参数 (Run 模式调优参数)</span>
+            </div>
+            <span className="badge-pill pill-purple">官方 CLI 微调</span>
+          </div>
+
+          <div style={{ padding: '8px 4px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.5, margin: 0 }}>
+              以下参数在官方守护模式 (run) 下由路由器自动传递给底层 <code>vllm-router</code> 进程，用于前缀缓存感知控制与负载倾斜阈值调整。
+            </p>
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px' }}>
+              <div className="play-form-group">
+                <label className="play-label">负载绝对差阈值 (--balance-abs-threshold)</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="1000"
+                  className="play-input"
+                  value={balanceAbsThreshold}
+                  onChange={(e) => { setBalanceAbsThreshold(e.target.value); setHasChanges(true); }}
+                />
+                <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+                  节点在途请求数绝对差超过此值时触发重平衡 (默认: 4)
+                </span>
+              </div>
+
+              <div className="play-form-group">
+                <label className="play-label">负载相对比阈值 (--balance-rel-threshold)</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="1.0"
+                  max="10.0"
+                  className="play-input"
+                  value={balanceRelThreshold}
+                  onChange={(e) => { setBalanceRelThreshold(e.target.value); setHasChanges(true); }}
+                />
+                <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+                  最大与最小负载比值超过此阈值时触发调度修正 (默认: 1.1)
+                </span>
+              </div>
+
+              <div className="play-form-group">
+                <label className="play-label">前缀缓存复用阈值 (--cache-threshold)</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.0"
+                  max="1.0"
+                  className="play-input"
+                  value={cacheThreshold}
+                  onChange={(e) => { setCacheThreshold(e.target.value); setHasChanges(true); }}
+                />
+                <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+                  缓存感知 (cache_aware) 提示词前缀命中重合度阈值 (默认: 0.6)
+                </span>
+              </div>
+            </div>
+
+            <div className="play-form-group">
+              <label className="play-label">自定义额外 CLI 参数 (--extra-args)</label>
+              <input
+                type="text"
+                className="play-input"
+                placeholder="例如: --request-timeout 60 --max-num-seqs 256"
+                value={extraArgs}
+                onChange={(e) => { setExtraArgs(e.target.value); setHasChanges(true); }}
+              />
+              <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+                为 vllm-router 进程追加额外的自定义命令行参数，支持任意参数透传 (空格分隔)
+              </span>
+            </div>
+          </div>
+        </section>
       </div>
 
       {/* Per-Model Mode & Policy Rule Matrix */}
@@ -563,6 +681,8 @@ export default function ConfigRulesView({ clusterModels = [], onRefreshTopology,
                         >
                           <option value="">⚙️ 继承全局 ({globalPolicy})</option>
                           <option value="consistent_hash">一致性哈希 (consistent_hash)</option>
+                          <option value="cache_aware">前缀缓存感知 (cache_aware)</option>
+                          <option value="rendezvous_hash">最高随机权重哈希 (rendezvous_hash)</option>
                           <option value="round_robin">轮询分发 (round_robin)</option>
                           <option value="power_of_two">最小负载选择 (power_of_two)</option>
                           <option value="random">随机分发 (random)</option>

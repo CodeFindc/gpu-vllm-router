@@ -114,3 +114,75 @@ func TestSaveAndLoadConfigWithModels(t *testing.T) {
 		t.Errorf("unexpected model 1: %+v", loaded.Models[1])
 	}
 }
+
+func TestLoadConfigWithTuningParameters(t *testing.T) {
+	yamlContent := `
+target:
+  policy: "cache_aware"
+
+router:
+  mode: "run"
+  balance_abs_threshold: 4
+  balance_rel_threshold: 1.1
+  cache_threshold: 0.6
+  extra_args:
+    - "--request-timeout"
+    - "60"
+
+models:
+  - model_name: "custom-cache-model"
+    mode: "run"
+    policy: "rendezvous_hash"
+    balance_abs_threshold: 8
+    balance_rel_threshold: 1.2
+    cache_threshold: 0.8
+    extra_args: ["--max-num-seqs", "256"]
+`
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(yamlContent), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	cfg, err := LoadConfig(tmpFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if cfg.Target.Policy != "cache_aware" {
+		t.Errorf("expected target.policy cache_aware, got %s", cfg.Target.Policy)
+	}
+	if cfg.Router.BalanceAbsThreshold == nil || *cfg.Router.BalanceAbsThreshold != 4 {
+		t.Errorf("expected balance_abs_threshold 4, got %v", cfg.Router.BalanceAbsThreshold)
+	}
+	if cfg.Router.BalanceRelThreshold == nil || *cfg.Router.BalanceRelThreshold != 1.1 {
+		t.Errorf("expected balance_rel_threshold 1.1, got %v", cfg.Router.BalanceRelThreshold)
+	}
+	if cfg.Router.CacheThreshold == nil || *cfg.Router.CacheThreshold != 0.6 {
+		t.Errorf("expected cache_threshold 0.6, got %v", cfg.Router.CacheThreshold)
+	}
+	if len(cfg.Router.ExtraArgs) != 2 || cfg.Router.ExtraArgs[0] != "--request-timeout" {
+		t.Errorf("unexpected router extra_args: %v", cfg.Router.ExtraArgs)
+	}
+
+	if len(cfg.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(cfg.Models))
+	}
+	m := cfg.Models[0]
+	if m.Policy != "rendezvous_hash" {
+		t.Errorf("expected model policy rendezvous_hash, got %s", m.Policy)
+	}
+	if m.BalanceAbsThreshold == nil || *m.BalanceAbsThreshold != 8 {
+		t.Errorf("expected model balance_abs_threshold 8, got %v", m.BalanceAbsThreshold)
+	}
+	if m.BalanceRelThreshold == nil || *m.BalanceRelThreshold != 1.2 {
+		t.Errorf("expected model balance_rel_threshold 1.2, got %v", m.BalanceRelThreshold)
+	}
+	if m.CacheThreshold == nil || *m.CacheThreshold != 0.8 {
+		t.Errorf("expected model cache_threshold 0.8, got %v", m.CacheThreshold)
+	}
+	if len(m.ExtraArgs) != 2 || m.ExtraArgs[1] != "256" {
+		t.Errorf("unexpected model extra_args: %v", m.ExtraArgs)
+	}
+}
+

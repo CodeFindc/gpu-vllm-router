@@ -2,6 +2,7 @@ package router
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +20,11 @@ type Config struct {
 	PrefillURLs       []string `json:"prefill_urls"`
 	DecodeURLs        []string `json:"decode_urls"`
 	ExtraArgs         []string `json:"extra_args"`
+
+	// Tuning parameters for official vllm-router
+	BalanceAbsThreshold int     `json:"balance_abs_threshold,omitempty"` // --balance-abs-threshold
+	BalanceRelThreshold float64 `json:"balance_rel_threshold,omitempty"` // --balance-rel-threshold
+	CacheThreshold      float64 `json:"cache_threshold,omitempty"`       // --cache-threshold
 
 	// Built-in Circuit Breaker options for official vllm-router
 	CbFailureThreshold    int  `json:"cb_failure_threshold,omitempty"`     // --cb-failure-threshold
@@ -85,6 +91,17 @@ func BuildArgs(cfg Config) []string {
 	} else if len(cfg.WorkerURLs) > 0 {
 		args = append(args, "--worker-urls")
 		args = append(args, cfg.WorkerURLs...)
+	}
+
+	// Load balancing threshold & cache tuning flags for official vllm-router
+	if cfg.BalanceAbsThreshold > 0 {
+		args = append(args, "--balance-abs-threshold", strconv.Itoa(cfg.BalanceAbsThreshold))
+	}
+	if cfg.BalanceRelThreshold > 0 {
+		args = append(args, "--balance-rel-threshold", strconv.FormatFloat(cfg.BalanceRelThreshold, 'f', -1, 64))
+	}
+	if cfg.CacheThreshold > 0 {
+		args = append(args, "--cache-threshold", strconv.FormatFloat(cfg.CacheThreshold, 'f', -1, 64))
 	}
 
 	// Circuit Breaker CLI flags

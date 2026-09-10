@@ -64,9 +64,13 @@ type ResetBreakerResponse struct {
 
 // ModelRuleDTO represents a model rule transferred over REST API.
 type ModelRuleDTO struct {
-	ModelName string `json:"model_name"`
-	Mode      string `json:"mode,omitempty"`   // "proxy", "run" or "" (inherit)
-	Policy    string `json:"policy,omitempty"` // "consistent_hash", etc. or "" (inherit)
+	ModelName           string   `json:"model_name"`
+	Mode                string   `json:"mode,omitempty"`   // "proxy", "run" or "" (inherit)
+	Policy              string   `json:"policy,omitempty"` // "consistent_hash", etc. or "" (inherit)
+	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
+	ExtraArgs           []string `json:"extra_args,omitempty"`
 }
 
 // ConfigSnapshot represents the current active system configuration for dashboard viewing and editing.
@@ -76,6 +80,10 @@ type ConfigSnapshot struct {
 	WatchIntervalSecs       int            `json:"watch_interval_secs"`        // e.g. 10
 	ZeroDowntime            bool           `json:"zero_downtime"`              // true/false
 	DrainTimeoutSecs        int            `json:"drain_timeout_secs"`         // e.g. 60
+	BalanceAbsThreshold     *int           `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold     *float64       `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold          *float64       `json:"cache_threshold,omitempty"`
+	ExtraArgs               []string       `json:"extra_args,omitempty"`
 	CircuitBreakerEnabled   bool           `json:"circuit_breaker_enabled"`    // true/false
 	MaxFailures             int            `json:"max_failures"`               // e.g. 3
 	CooldownSecs            int            `json:"cooldown_secs"`              // e.g. 10
@@ -83,7 +91,7 @@ type ConfigSnapshot struct {
 	HealthCheckIntervalSecs int            `json:"health_check_interval_secs"` // e.g. 3
 	SuccessThreshold        int            `json:"success_threshold"`          // e.g. 2
 	Models                  []ModelRuleDTO `json:"models"`                     // Custom per-model rules
-	AvailablePolicies       []string       `json:"available_policies"`         // ["consistent_hash", "round_robin", "power_of_two", "random"]
+	AvailablePolicies       []string       `json:"available_policies"`         // 6 supported policies
 	AvailableModes          []string       `json:"available_modes"`            // ["proxy", "run"]
 	ConfigFilePath          string         `json:"config_file_path"`           // e.g. "config.yaml"
 }
@@ -95,6 +103,10 @@ type ConfigUpdateRequest struct {
 	WatchIntervalSecs       *int           `json:"watch_interval_secs,omitempty"`
 	ZeroDowntime            *bool          `json:"zero_downtime,omitempty"`
 	DrainTimeoutSecs        *int           `json:"drain_timeout_secs,omitempty"`
+	BalanceAbsThreshold     *int           `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold     *float64       `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold          *float64       `json:"cache_threshold,omitempty"`
+	ExtraArgs               []string       `json:"extra_args,omitempty"`
 	CircuitBreakerEnabled   *bool          `json:"circuit_breaker_enabled,omitempty"`
 	MaxFailures             *int           `json:"max_failures,omitempty"`
 	CooldownSecs            *int           `json:"cooldown_secs,omitempty"`
@@ -106,9 +118,13 @@ type ConfigUpdateRequest struct {
 
 // ModelRuleUpdateRequest updates mode and/or policy for a specific model.
 type ModelRuleUpdateRequest struct {
-	ModelName string `json:"model_name"`
-	Mode      string `json:"mode"`   // "proxy", "run", or "" (reset to inherit)
-	Policy    string `json:"policy"` // "consistent_hash", etc. or "" (reset to inherit)
+	ModelName           string   `json:"model_name"`
+	Mode                string   `json:"mode"`   // "proxy", "run", or "" (reset to inherit)
+	Policy              string   `json:"policy"` // "consistent_hash", etc. or "" (reset to inherit)
+	BalanceAbsThreshold *int     `json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold *float64 `json:"balance_rel_threshold,omitempty"`
+	CacheThreshold      *float64 `json:"cache_threshold,omitempty"`
+	ExtraArgs           []string `json:"extra_args,omitempty"`
 }
 
 // ConfigUpdateResponse represents the response after saving configuration.

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -58,6 +59,12 @@ func main() {
 	dpSize := flag.Int("dp-size", 1, "数据并行度 (intra-node data parallel size)")
 	zeroDowntime := flag.Bool("zero-downtime", true, "run 模式是否启用蓝绿双进程零停机平滑滚动热重载 (推荐开启)")
 	drainTimeout := flag.Duration("drain-timeout", 60*time.Second, "run 模式热重载时旧进程的优雅排空等待超时时间")
+
+	// Tuning Flags for official vllm-router
+	balAbsThresh := flag.Int("balance-abs-threshold", 0, "vllm-router 负载绝对差均衡阈值 (如 4)")
+	balRelThresh := flag.Float64("balance-rel-threshold", 0.0, "vllm-router 负载相对比均衡阈值 (如 1.1)")
+	cacheThresh := flag.Float64("cache-threshold", 0.0, "vllm-router 前缀缓存命中复用阈值 (如 0.6)")
+	extraArgsFlag := flag.String("extra-args", "", "vllm-router 额外自定义 CLI 参数 (空格分隔)")
 
 	flag.Parse()
 
@@ -125,6 +132,15 @@ func main() {
 		}
 		if !explicitFlags["drain-timeout"] && fileCfg.Router.DrainTimeout > 0 {
 			*drainTimeout = fileCfg.Router.DrainTimeout
+		}
+		if !explicitFlags["balance-abs-threshold"] && fileCfg.Router.BalanceAbsThreshold != nil {
+			*balAbsThresh = *fileCfg.Router.BalanceAbsThreshold
+		}
+		if !explicitFlags["balance-rel-threshold"] && fileCfg.Router.BalanceRelThreshold != nil {
+			*balRelThresh = *fileCfg.Router.BalanceRelThreshold
+		}
+		if !explicitFlags["cache-threshold"] && fileCfg.Router.CacheThreshold != nil {
+			*cacheThresh = *fileCfg.Router.CacheThreshold
 		}
 	}
 
@@ -301,6 +317,21 @@ func main() {
 		}
 	}
 
+	if *balAbsThresh > 0 {
+		routerCfg.BalanceAbsThreshold = *balAbsThresh
+	}
+	if *balRelThresh > 0 {
+		routerCfg.BalanceRelThreshold = *balRelThresh
+	}
+	if *cacheThresh > 0 {
+		routerCfg.CacheThreshold = *cacheThresh
+	}
+	if *extraArgsFlag != "" {
+		routerCfg.ExtraArgs = strings.Fields(*extraArgsFlag)
+	} else if fileCfg != nil && len(fileCfg.Router.ExtraArgs) > 0 {
+		routerCfg.ExtraArgs = fileCfg.Router.ExtraArgs
+	}
+
 	switch *mode {
 	case "cmd":
 		fmt.Println(">>> 1. Linux / macOS (Bash) 启动命令:")
@@ -384,17 +415,34 @@ func main() {
 			}
 		}
 
+		var balAbsPtr *int
+		if *balAbsThresh > 0 {
+			balAbsPtr = balAbsThresh
+		}
+		var balRelPtr *float64
+		if *balRelThresh > 0 {
+			balRelPtr = balRelThresh
+		}
+		var cacheThreshPtr *float64
+		if *cacheThresh > 0 {
+			cacheThreshPtr = cacheThresh
+		}
+
 		proxyCfg := proxy.ServerConfig{
-			Host:           *host,
-			Port:           *port,
-			Policy:         selectedPolicy,
-			ModelName:      *modelName,
-			WatchInterval:  *watchInterval,
-			CircuitBreaker: cbCfg,
-			ConfigFilePath: resolvedConfigPath,
-			ModelRules:     modelRules,
-			ZeroDowntime:   *zeroDowntime,
-			DrainTimeout:   *drainTimeout,
+			Host:                *host,
+			Port:                *port,
+			Policy:              selectedPolicy,
+			ModelName:           *modelName,
+			WatchInterval:       *watchInterval,
+			CircuitBreaker:      cbCfg,
+			ConfigFilePath:      resolvedConfigPath,
+			ModelRules:          modelRules,
+			ZeroDowntime:        *zeroDowntime,
+			DrainTimeout:        *drainTimeout,
+			BalanceAbsThreshold: balAbsPtr,
+			BalanceRelThreshold: balRelPtr,
+			CacheThreshold:      cacheThreshPtr,
+			ExtraArgs:           routerCfg.ExtraArgs,
 		}
 		srv := proxy.NewServer(proxyCfg, client)
 

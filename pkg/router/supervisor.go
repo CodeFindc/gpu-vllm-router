@@ -385,10 +385,14 @@ func (s *Supervisor) Start(ctx context.Context) error {
 }
 
 func (s *Supervisor) doSpawn(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error) {
+	return s.doSpawnForModel(ctx, "", host, port, workerURLs)
+}
+
+func (s *Supervisor) doSpawnForModel(ctx context.Context, modelName string, host string, port int, workerURLs []string) (*runningProcess, error) {
 	if s.spawnProcessFunc != nil {
 		return s.spawnProcessFunc(ctx, host, port, workerURLs)
 	}
-	return s.spawnProcess(ctx, host, port, workerURLs)
+	return s.spawnProcessForModel(ctx, modelName, host, port, workerURLs)
 }
 
 func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, workerURLs []string) (*ModelRunner, error) {
@@ -424,7 +428,7 @@ func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, wor
 
 	log.Printf("[Supervisor] Launching vllm-router process for [%s] on internal port %d (Workers: %d)...",
 		modelName, internalPort, len(workerURLs))
-	proc, err := s.doSpawn(ctx, "127.0.0.1", internalPort, workerURLs)
+	proc, err := s.doSpawnForModel(ctx, modelName, "127.0.0.1", internalPort, workerURLs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn router process for %s: %w", modelName, err)
 	}
@@ -732,10 +736,39 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Supervisor) spawnProcess(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error) {
+	return s.spawnProcessForModel(ctx, "", host, port, workerURLs)
+}
+
+func (s *Supervisor) spawnProcessForModel(ctx context.Context, modelName string, host string, port int, workerURLs []string) (*runningProcess, error) {
 	cfg := s.cfg.RouterCfg
 	cfg.Host = host
 	cfg.Port = port
 	cfg.WorkerURLs = workerURLs
+
+	if modelName != "" {
+		s.mu.RLock()
+		rule, ok := s.modelRules[modelName]
+		s.mu.RUnlock()
+		if ok {
+			if rule.Policy != "" {
+				if p, err := ParsePolicy(rule.Policy); err == nil {
+					cfg.Policy = p
+				}
+			}
+			if rule.BalanceAbsThreshold != nil && *rule.BalanceAbsThreshold > 0 {
+				cfg.BalanceAbsThreshold = *rule.BalanceAbsThreshold
+			}
+			if rule.BalanceRelThreshold != nil && *rule.BalanceRelThreshold > 0 {
+				cfg.BalanceRelThreshold = *rule.BalanceRelThreshold
+			}
+			if rule.CacheThreshold != nil && *rule.CacheThreshold > 0 {
+				cfg.CacheThreshold = *rule.CacheThreshold
+			}
+			if len(rule.ExtraArgs) > 0 {
+				cfg.ExtraArgs = rule.ExtraArgs
+			}
+		}
+	}
 
 	args := BuildArgs(cfg)
 	bin := cfg.RouterBin
@@ -743,7 +776,8 @@ func (s *Supervisor) spawnProcess(ctx context.Context, host string, port int, wo
 		bin = "vllm-router"
 	}
 
-	log.Printf("[Supervisor] Spawning %s on %s:%d (Workers: %d, Policy: %s)", bin, host, port, len(workerURLs), cfg.Policy)
+	log.Printf("[Supervisor] Spawning %s on %s:%d (Model: %q, Workers: %d, Policy: %s, Tuning: Abs=%d, Rel=%.2f, Cache=%.2f, Extra=%v)",
+		bin, host, port, modelName, len(workerURLs), cfg.Policy, cfg.BalanceAbsThreshold, cfg.BalanceRelThreshold, cfg.CacheThreshold, cfg.ExtraArgs)
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = os.Environ()
@@ -1224,7 +1258,7 @@ func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, run
 
 	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 1/4: Launching candidate on internal port %d (New Workers: %d)...",
 		runner.ModelName, nextPort, len(newURLs))
-	newProc, err := s.doSpawn(ctx, "127.0.0.1", nextPort, newURLs)
+	newProc, err := s.doSpawnForModel(ctx, runner.ModelName, "127.0.0.1", nextPort, newURLs)
 	if err != nil {
 		log.Printf("[Supervisor] Failed to spawn candidate for [%s]: %v", runner.ModelName, err)
 		return
@@ -1481,13 +1515,29 @@ func (s *Supervisor) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdat
 	if req.HealthCheckIntervalSecs != nil && *req.HealthCheckIntervalSecs > 0 {
 		s.cfg.WorkerProbeInterval = time.Duration(*req.HealthCheckIntervalSecs) * time.Second
 	}
+	if req.BalanceAbsThreshold != nil {
+		s.cfg.RouterCfg.BalanceAbsThreshold = *req.BalanceAbsThreshold
+	}
+	if req.BalanceRelThreshold != nil {
+		s.cfg.RouterCfg.BalanceRelThreshold = *req.BalanceRelThreshold
+	}
+	if req.CacheThreshold != nil {
+		s.cfg.RouterCfg.CacheThreshold = *req.CacheThreshold
+	}
+	if req.ExtraArgs != nil {
+		s.cfg.RouterCfg.ExtraArgs = req.ExtraArgs
+	}
 
 	if req.Models != nil {
 		for _, m := range req.Models {
 			rule := config.ModelRule{
-				ModelName: m.ModelName,
-				Mode:      m.Mode,
-				Policy:    m.Policy,
+				ModelName:           m.ModelName,
+				Mode:                m.Mode,
+				Policy:              m.Policy,
+				BalanceAbsThreshold: m.BalanceAbsThreshold,
+				BalanceRelThreshold: m.BalanceRelThreshold,
+				CacheThreshold:      m.CacheThreshold,
+				ExtraArgs:           m.ExtraArgs,
 			}
 			s.modelRules[m.ModelName] = rule
 			s.applyModelRuleLocked(ctx, rule)
@@ -1504,9 +1554,13 @@ func (s *Supervisor) UpdateModelRule(ctx context.Context, req dashboard.ModelRul
 	defer s.mu.Unlock()
 
 	rule := config.ModelRule{
-		ModelName: req.ModelName,
-		Mode:      req.Mode,
-		Policy:    req.Policy,
+		ModelName:           req.ModelName,
+		Mode:                req.Mode,
+		Policy:              req.Policy,
+		BalanceAbsThreshold: req.BalanceAbsThreshold,
+		BalanceRelThreshold: req.BalanceRelThreshold,
+		CacheThreshold:      req.CacheThreshold,
+		ExtraArgs:           req.ExtraArgs,
 	}
 	s.modelRules[req.ModelName] = rule
 	s.applyModelRuleLocked(ctx, rule)
@@ -1534,6 +1588,7 @@ func (s *Supervisor) applyModelRuleLocked(ctx context.Context, rule config.Model
 	}
 
 	prevMode := runner.Mode
+	prevPolicy := runner.Policy
 	runner.Mode = targetMode
 	runner.Policy = targetPolicy
 
@@ -1561,6 +1616,10 @@ func (s *Supervisor) applyModelRuleLocked(ctx context.Context, rule config.Model
 			runner.ActiveTarget = r.ActiveTarget
 			runner.mu.Unlock()
 		}(runner.ModelName, append([]string(nil), runner.AllURLs...))
+	} else if targetMode == "run" && prevMode == "run" && (prevPolicy != targetPolicy || rule.BalanceAbsThreshold != nil || rule.BalanceRelThreshold != nil || rule.CacheThreshold != nil || len(rule.ExtraArgs) > 0) && len(runner.ActiveURLs) > 0 {
+		// Policy or tuning parameter changed while in run mode: trigger zero-downtime rolling reload
+		log.Printf("[Supervisor] Policy/tuning parameters changed for [%s] in run mode. Triggering zero-downtime rolling reload...", runner.ModelName)
+		go s.performZeroDowntimeReloadForRunner(context.Background(), runner, append([]string(nil), runner.ActiveURLs...))
 	}
 }
 
@@ -1569,14 +1628,34 @@ func (s *Supervisor) saveConfigToFileLocked() error {
 		s.configFilePath = "config.yaml"
 	}
 
+	var balAbs *int
+	if s.cfg.RouterCfg.BalanceAbsThreshold > 0 {
+		v := s.cfg.RouterCfg.BalanceAbsThreshold
+		balAbs = &v
+	}
+	var balRel *float64
+	if s.cfg.RouterCfg.BalanceRelThreshold > 0 {
+		v := s.cfg.RouterCfg.BalanceRelThreshold
+		balRel = &v
+	}
+	var cacheThresh *float64
+	if s.cfg.RouterCfg.CacheThreshold > 0 {
+		v := s.cfg.RouterCfg.CacheThreshold
+		cacheThresh = &v
+	}
+
 	cfgToSave := &config.FileConfig{
 		Router: config.RouterConfig{
-			Mode:          "run",
-			Host:          s.cfg.PublicHost,
-			Port:          s.cfg.PublicPort,
-			WatchInterval: s.cfg.WatchInterval,
-			ZeroDowntime:  &s.cfg.ZeroDowntime,
-			DrainTimeout:  s.cfg.DrainTimeout,
+			Mode:                "run",
+			Host:                s.cfg.PublicHost,
+			Port:                s.cfg.PublicPort,
+			WatchInterval:       s.cfg.WatchInterval,
+			ZeroDowntime:        &s.cfg.ZeroDowntime,
+			DrainTimeout:        s.cfg.DrainTimeout,
+			BalanceAbsThreshold: balAbs,
+			BalanceRelThreshold: balRel,
+			CacheThreshold:      cacheThresh,
+			ExtraArgs:           s.cfg.RouterCfg.ExtraArgs,
 		},
 		Target: config.TargetConfig{
 			ModelName: s.modelName,
@@ -1599,9 +1678,13 @@ func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
 	var models []dashboard.ModelRuleDTO
 	for mName, r := range s.modelRules {
 		models = append(models, dashboard.ModelRuleDTO{
-			ModelName: mName,
-			Mode:      r.Mode,
-			Policy:    r.Policy,
+			ModelName:           mName,
+			Mode:                r.Mode,
+			Policy:              r.Policy,
+			BalanceAbsThreshold: r.BalanceAbsThreshold,
+			BalanceRelThreshold: r.BalanceRelThreshold,
+			CacheThreshold:      r.CacheThreshold,
+			ExtraArgs:           r.ExtraArgs,
 		})
 	}
 	existing := make(map[string]bool)
@@ -1633,12 +1716,32 @@ func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
 		return models[i].ModelName < models[j].ModelName
 	})
 
+	var balAbs *int
+	if s.cfg.RouterCfg.BalanceAbsThreshold > 0 {
+		v := s.cfg.RouterCfg.BalanceAbsThreshold
+		balAbs = &v
+	}
+	var balRel *float64
+	if s.cfg.RouterCfg.BalanceRelThreshold > 0 {
+		v := s.cfg.RouterCfg.BalanceRelThreshold
+		balRel = &v
+	}
+	var cacheThresh *float64
+	if s.cfg.RouterCfg.CacheThreshold > 0 {
+		v := s.cfg.RouterCfg.CacheThreshold
+		cacheThresh = &v
+	}
+
 	return &dashboard.ConfigSnapshot{
 		Mode:                    "run",
 		Policy:                  string(s.cfg.RouterCfg.Policy),
 		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
 		ZeroDowntime:            s.cfg.ZeroDowntime,
 		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
+		BalanceAbsThreshold:     balAbs,
+		BalanceRelThreshold:     balRel,
+		CacheThreshold:          cacheThresh,
+		ExtraArgs:               s.cfg.RouterCfg.ExtraArgs,
 		CircuitBreakerEnabled:   true,
 		MaxFailures:             s.cfg.WorkerMaxFailures,
 		CooldownSecs:            10,
@@ -1646,7 +1749,7 @@ func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
 		HealthCheckIntervalSecs: int(s.cfg.WorkerProbeInterval.Seconds()),
 		SuccessThreshold:        2,
 		Models:                  models,
-		AvailablePolicies:       []string{"consistent_hash", "round_robin", "power_of_two", "random"},
+		AvailablePolicies:       []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "random"},
 		AvailableModes:          []string{"proxy", "run"},
 		ConfigFilePath:          s.configFilePath,
 	}

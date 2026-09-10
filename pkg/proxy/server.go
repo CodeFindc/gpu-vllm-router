@@ -27,28 +27,36 @@ import (
 
 // ServerConfig configures the native Go reverse proxy server.
 type ServerConfig struct {
-	Host           string
-	Port           int
-	Policy         router.Policy
-	ModelName      string // If empty, operates in full-cluster multi-model mode
-	WatchInterval  time.Duration
-	CircuitBreaker CircuitBreakerConfig
-	ConfigFilePath string
-	ModelRules     []config.ModelRule
-	ZeroDowntime   bool
-	DrainTimeout   time.Duration
+	Host                string
+	Port                int
+	Policy              router.Policy
+	ModelName           string // If empty, operates in full-cluster multi-model mode
+	WatchInterval       time.Duration
+	CircuitBreaker      CircuitBreakerConfig
+	ConfigFilePath      string
+	ModelRules          []config.ModelRule
+	ZeroDowntime        bool
+	DrainTimeout        time.Duration
+	BalanceAbsThreshold *int
+	BalanceRelThreshold *float64
+	CacheThreshold      *float64
+	ExtraArgs           []string
 }
 
 // ModelPool manages load balancing and active targets for a specific model.
 type ModelPool struct {
-	ModelName    string
-	Mode         string        // "proxy" (default) or "run"
-	Policy       router.Policy // per-model policy
-	Balancer     Balancer
-	Targets      []*BackendTarget
-	RunnerCmd    *exec.Cmd
-	RunnerTarget *url.URL
-	RunnerPort   int
+	ModelName           string
+	Mode                string        // "proxy" (default) or "run"
+	Policy              router.Policy // per-model policy
+	Balancer            Balancer
+	Targets             []*BackendTarget
+	RunnerCmd           *exec.Cmd
+	RunnerTarget        *url.URL
+	RunnerPort          int
+	BalanceAbsThreshold *int
+	BalanceRelThreshold *float64
+	CacheThreshold      *float64
+	ExtraArgs           []string
 }
 
 // routeState maintains in-flight routing state across retries and failovers.
@@ -1126,13 +1134,29 @@ func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateReq
 	if req.SuccessThreshold != nil && *req.SuccessThreshold > 0 {
 		s.cfg.CircuitBreaker.SuccessThreshold = *req.SuccessThreshold
 	}
+	if req.BalanceAbsThreshold != nil {
+		s.cfg.BalanceAbsThreshold = req.BalanceAbsThreshold
+	}
+	if req.BalanceRelThreshold != nil {
+		s.cfg.BalanceRelThreshold = req.BalanceRelThreshold
+	}
+	if req.CacheThreshold != nil {
+		s.cfg.CacheThreshold = req.CacheThreshold
+	}
+	if req.ExtraArgs != nil {
+		s.cfg.ExtraArgs = req.ExtraArgs
+	}
 
 	if req.Models != nil {
 		for _, m := range req.Models {
 			rule := config.ModelRule{
-				ModelName: m.ModelName,
-				Mode:      m.Mode,
-				Policy:    m.Policy,
+				ModelName:           m.ModelName,
+				Mode:                m.Mode,
+				Policy:              m.Policy,
+				BalanceAbsThreshold: m.BalanceAbsThreshold,
+				BalanceRelThreshold: m.BalanceRelThreshold,
+				CacheThreshold:      m.CacheThreshold,
+				ExtraArgs:           m.ExtraArgs,
 			}
 			s.modelRules[m.ModelName] = rule
 			s.applyModelRuleLocked(ctx, rule)
@@ -1149,9 +1173,13 @@ func (s *Server) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpd
 	defer s.mu.Unlock()
 
 	rule := config.ModelRule{
-		ModelName: req.ModelName,
-		Mode:      req.Mode,
-		Policy:    req.Policy,
+		ModelName:           req.ModelName,
+		Mode:                req.Mode,
+		Policy:              req.Policy,
+		BalanceAbsThreshold: req.BalanceAbsThreshold,
+		BalanceRelThreshold: req.BalanceRelThreshold,
+		CacheThreshold:      req.CacheThreshold,
+		ExtraArgs:           req.ExtraArgs,
 	}
 	s.modelRules[req.ModelName] = rule
 	s.applyModelRuleLocked(ctx, rule)
@@ -1183,6 +1211,11 @@ func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule
 		pool.Balancer = NewBalancer(s.cfg.Policy, pool.Targets)
 	}
 
+	pool.BalanceAbsThreshold = rule.BalanceAbsThreshold
+	pool.BalanceRelThreshold = rule.BalanceRelThreshold
+	pool.CacheThreshold = rule.CacheThreshold
+	pool.ExtraArgs = rule.ExtraArgs
+
 	// Mode run: spawn runner if needed
 	if targetMode == "run" && prevMode != "run" && len(pool.Targets) > 0 {
 		var urls []string
@@ -1211,14 +1244,45 @@ func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get free port: %w", err)
 	}
+
+	balAbs := 0
+	if pool.BalanceAbsThreshold != nil && *pool.BalanceAbsThreshold > 0 {
+		balAbs = *pool.BalanceAbsThreshold
+	} else if s.cfg.BalanceAbsThreshold != nil && *s.cfg.BalanceAbsThreshold > 0 {
+		balAbs = *s.cfg.BalanceAbsThreshold
+	}
+
+	balRel := 0.0
+	if pool.BalanceRelThreshold != nil && *pool.BalanceRelThreshold > 0 {
+		balRel = *pool.BalanceRelThreshold
+	} else if s.cfg.BalanceRelThreshold != nil && *s.cfg.BalanceRelThreshold > 0 {
+		balRel = *s.cfg.BalanceRelThreshold
+	}
+
+	cacheThresh := 0.0
+	if pool.CacheThreshold != nil && *pool.CacheThreshold > 0 {
+		cacheThresh = *pool.CacheThreshold
+	} else if s.cfg.CacheThreshold != nil && *s.cfg.CacheThreshold > 0 {
+		cacheThresh = *s.cfg.CacheThreshold
+	}
+
+	extraArgs := pool.ExtraArgs
+	if len(extraArgs) == 0 {
+		extraArgs = s.cfg.ExtraArgs
+	}
+
 	cfg := router.Config{
-		RouterBin:  "vllm-router",
-		Host:       "127.0.0.1",
-		Port:       freePort,
-		Policy:     pool.Policy,
-		WorkerURLs: urls,
-		Backend:    "vllm",
-		LogLevel:   "info",
+		RouterBin:           "vllm-router",
+		Host:                "127.0.0.1",
+		Port:                freePort,
+		Policy:              pool.Policy,
+		WorkerURLs:          urls,
+		Backend:             "vllm",
+		LogLevel:            "info",
+		BalanceAbsThreshold: balAbs,
+		BalanceRelThreshold: balRel,
+		CacheThreshold:      cacheThresh,
+		ExtraArgs:           extraArgs,
 	}
 	args := router.BuildArgs(cfg)
 	cmd := exec.Command("vllm-router", args...)
@@ -1246,12 +1310,16 @@ func (s *Server) saveConfigToFileLocked() error {
 
 	cfgToSave := &config.FileConfig{
 		Router: config.RouterConfig{
-			Mode:          "proxy",
-			Host:          s.cfg.Host,
-			Port:          s.cfg.Port,
-			WatchInterval: s.cfg.WatchInterval,
-			ZeroDowntime:  &s.cfg.ZeroDowntime,
-			DrainTimeout:  s.cfg.DrainTimeout,
+			Mode:                "proxy",
+			Host:                s.cfg.Host,
+			Port:                s.cfg.Port,
+			WatchInterval:       s.cfg.WatchInterval,
+			ZeroDowntime:        &s.cfg.ZeroDowntime,
+			DrainTimeout:        s.cfg.DrainTimeout,
+			BalanceAbsThreshold: s.cfg.BalanceAbsThreshold,
+			BalanceRelThreshold: s.cfg.BalanceRelThreshold,
+			CacheThreshold:      s.cfg.CacheThreshold,
+			ExtraArgs:           s.cfg.ExtraArgs,
 		},
 		Target: config.TargetConfig{
 			ModelName: s.cfg.ModelName,
@@ -1279,9 +1347,13 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 	var models []dashboard.ModelRuleDTO
 	for mName, r := range s.modelRules {
 		models = append(models, dashboard.ModelRuleDTO{
-			ModelName: mName,
-			Mode:      r.Mode,
-			Policy:    r.Policy,
+			ModelName:           mName,
+			Mode:                r.Mode,
+			Policy:              r.Policy,
+			BalanceAbsThreshold: r.BalanceAbsThreshold,
+			BalanceRelThreshold: r.BalanceRelThreshold,
+			CacheThreshold:      r.CacheThreshold,
+			ExtraArgs:           r.ExtraArgs,
 		})
 	}
 	existing := make(map[string]bool)
@@ -1321,6 +1393,10 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
 		ZeroDowntime:            s.cfg.ZeroDowntime,
 		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
+		BalanceAbsThreshold:     s.cfg.BalanceAbsThreshold,
+		BalanceRelThreshold:     s.cfg.BalanceRelThreshold,
+		CacheThreshold:          s.cfg.CacheThreshold,
+		ExtraArgs:               s.cfg.ExtraArgs,
 		CircuitBreakerEnabled:   cbEnabled,
 		MaxFailures:             s.cfg.CircuitBreaker.MaxFailures,
 		CooldownSecs:            int(s.cfg.CircuitBreaker.Cooldown.Seconds()),
@@ -1328,7 +1404,7 @@ func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
 		HealthCheckIntervalSecs: int(s.cfg.CircuitBreaker.HealthCheckInterval.Seconds()),
 		SuccessThreshold:        s.cfg.CircuitBreaker.SuccessThreshold,
 		Models:                  models,
-		AvailablePolicies:       []string{"consistent_hash", "round_robin", "power_of_two", "random"},
+		AvailablePolicies:       []string{"consistent_hash", "cache_aware", "rendezvous_hash", "round_robin", "power_of_two", "random"},
 		AvailableModes:          []string{"proxy", "run"},
 		ConfigFilePath:          s.configFilePath,
 	}

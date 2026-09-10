@@ -2,6 +2,8 @@ import React from 'react';
 
 const POLICY_NAMES = {
   consistent_hash: '一致性哈希',
+  cache_aware: '前缀缓存感知 (Cache Aware)',
+  rendezvous_hash: '最高随机权重 (HRW)',
   round_robin: '轮询分发',
   power_of_two: '最小负载 (P2C)',
   random: '随机分发',

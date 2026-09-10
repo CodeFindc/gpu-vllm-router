@@ -123,3 +123,34 @@ func TestBuildArgsWithCircuitBreaker(t *testing.T) {
 		t.Errorf("expected --disable-retries in %s", cmdDisabledStr)
 	}
 }
+
+func TestBuildArgsWithThresholdsAndExtraArgs(t *testing.T) {
+	cfg := Config{
+		Host:                "0.0.0.0",
+		Port:                8000,
+		Policy:              PolicyCacheAware,
+		WorkerURLs:          []string{"http://10.0.0.1:8000", "http://10.0.0.2:8000"},
+		BalanceAbsThreshold: 4,
+		BalanceRelThreshold: 1.1,
+		CacheThreshold:      0.6,
+		ExtraArgs:           []string{"--request-timeout", "60"},
+	}
+
+	args := BuildArgs(cfg)
+	cmdStr := strings.Join(args, " ")
+
+	expectedFlags := []string{
+		"--policy cache_aware",
+		"--balance-abs-threshold 4",
+		"--balance-rel-threshold 1.1",
+		"--cache-threshold 0.6",
+		"--request-timeout 60",
+	}
+
+	for _, flag := range expectedFlags {
+		if !strings.Contains(cmdStr, flag) {
+			t.Errorf("expected command string to contain %q, but got: %s", flag, cmdStr)
+		}
+	}
+}
+

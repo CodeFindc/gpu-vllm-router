@@ -25,14 +25,18 @@ type TargetConfig struct {
 
 // RouterConfig holds settings for the router service.
 type RouterConfig struct {
-	Mode             string        `yaml:"mode"`
-	Host             string        `yaml:"host"`
-	Port             int           `yaml:"port"`
-	RouterBin        string        `yaml:"router_bin"`
-	WatchInterval    time.Duration `yaml:"watch_interval"`
-	DataParallelSize int           `yaml:"data_parallel_size"`
-	ZeroDowntime     *bool         `yaml:"zero_downtime"`
-	DrainTimeout     time.Duration `yaml:"drain_timeout"`
+	Mode                string        `yaml:"mode"`
+	Host                string        `yaml:"host"`
+	Port                int           `yaml:"port"`
+	RouterBin           string        `yaml:"router_bin"`
+	WatchInterval       time.Duration `yaml:"watch_interval"`
+	DataParallelSize    int           `yaml:"data_parallel_size"`
+	ZeroDowntime        *bool         `yaml:"zero_downtime"`
+	DrainTimeout        time.Duration `yaml:"drain_timeout"`
+	BalanceAbsThreshold *int          `yaml:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold *float64      `yaml:"balance_rel_threshold,omitempty"`
+	CacheThreshold      *float64      `yaml:"cache_threshold,omitempty"`
+	ExtraArgs           []string      `yaml:"extra_args,omitempty"`
 }
 
 // CircuitBreakerConfig holds settings for circuit breaker and failover.
@@ -50,9 +54,13 @@ type CircuitBreakerConfig struct {
 
 // ModelRule holds per-model routing override settings.
 type ModelRule struct {
-	ModelName string `yaml:"model_name" json:"model_name"`
-	Mode      string `yaml:"mode,omitempty" json:"mode,omitempty"`     // "proxy" or "run" (empty = inherit global)
-	Policy    string `yaml:"policy,omitempty" json:"policy,omitempty"` // "consistent_hash", etc. (empty = inherit global)
+	ModelName           string   `yaml:"model_name" json:"model_name"`
+	Mode                string   `yaml:"mode,omitempty" json:"mode,omitempty"`     // "proxy" or "run" (empty = inherit global)
+	Policy              string   `yaml:"policy,omitempty" json:"policy,omitempty"` // "consistent_hash", etc. (empty = inherit global)
+	BalanceAbsThreshold *int     `yaml:"balance_abs_threshold,omitempty" json:"balance_abs_threshold,omitempty"`
+	BalanceRelThreshold *float64 `yaml:"balance_rel_threshold,omitempty" json:"balance_rel_threshold,omitempty"`
+	CacheThreshold      *float64 `yaml:"cache_threshold,omitempty" json:"cache_threshold,omitempty"`
+	ExtraArgs           []string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"`
 }
 
 // FileConfig represents the full structure of config.yaml.

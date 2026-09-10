@@ -323,6 +323,135 @@ func extractSessionKey(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// --- Rendezvous (HRW) Hash Balancer ---
+
+type RendezvousHashBalancer struct {
+	BaseBalancer
+}
+
+func NewRendezvousHashBalancer(targets []*BackendTarget) *RendezvousHashBalancer {
+	b := &RendezvousHashBalancer{}
+	b.SetTargets(targets)
+	return b
+}
+
+func (b *RendezvousHashBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *RendezvousHashBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	available := b.getAvailableTargets(excluded)
+	if len(available) == 0 {
+		if len(excluded) > 0 {
+			return nil, errors.New("no alternative healthy backends available for failover on rendezvous hash")
+		}
+		return nil, errors.New("all backends are currently isolated by circuit breaker (OPEN)")
+	}
+
+	key := extractSessionKey(r)
+
+	// Highest Random Weight (HRW) algorithm
+	var bestTarget *BackendTarget
+	var maxWeight uint32
+
+	for _, target := range available {
+		weight := hashKey(key + "#" + target.URLString)
+		if bestTarget == nil || weight > maxWeight {
+			bestTarget = target
+			maxWeight = weight
+		}
+	}
+
+	return bestTarget, nil
+}
+
+// --- Cache Aware Balancer ---
+
+type CacheAwareBalancer struct {
+	ConsistentHashBalancer
+}
+
+func NewCacheAwareBalancer(targets []*BackendTarget, virtualNodes int) *CacheAwareBalancer {
+	ch := NewConsistentHashBalancer(targets, virtualNodes)
+	return &CacheAwareBalancer{*ch}
+}
+
+func (b *CacheAwareBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *CacheAwareBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if len(b.targets) == 0 || len(b.ring) == 0 {
+		return nil, errors.New("no backends available in pool")
+	}
+
+	key := extractCacheAwareKey(r)
+	h := hashKey(key)
+
+	startIdx := sort.Search(len(b.ring), func(i int) bool { return b.ring[i] >= h })
+	if startIdx >= len(b.ring) {
+		startIdx = 0
+	}
+
+	for i := 0; i < len(b.ring); i++ {
+		idx := (startIdx + i) % len(b.ring)
+		target := b.ringMap[b.ring[idx]]
+		if target == nil {
+			continue
+		}
+		if excluded != nil && excluded[target.URLString] {
+			continue
+		}
+		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			return target, nil
+		}
+	}
+
+	if len(excluded) > 0 {
+		return nil, errors.New("no alternative healthy backends available for failover on cache-aware ring")
+	}
+	return nil, errors.New("all backends on cache-aware ring are currently isolated by circuit breaker (OPEN)")
+}
+
+func extractCacheAwareKey(r *http.Request) string {
+	// Try to extract prompt prefix from JSON body if present
+	if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err == nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			var reqMap map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &reqMap); err == nil {
+				// 1. Check prompt string
+				if prompt, ok := reqMap["prompt"].(string); ok && prompt != "" {
+					if len(prompt) > 256 {
+						prompt = prompt[:256]
+					}
+					return "prompt:" + prompt
+				}
+				// 2. Check messages array for chat completions
+				if msgs, ok := reqMap["messages"].([]interface{}); ok && len(msgs) > 0 {
+					if firstMsg, ok := msgs[0].(map[string]interface{}); ok {
+						if content, ok := firstMsg["content"].(string); ok && content != "" {
+							if len(content) > 256 {
+								content = content[:256]
+							}
+							return "chat_prefix:" + content
+						}
+					}
+				}
+			}
+		}
+	}
+	return extractSessionKey(r)
+}
+
 // NewBalancer creates a Balancer based on Policy.
 func NewBalancer(policy router.Policy, targets []*BackendTarget) Balancer {
 	switch policy {
@@ -332,9 +461,14 @@ func NewBalancer(policy router.Policy, targets []*BackendTarget) Balancer {
 		return NewRandomBalancer(targets)
 	case router.PolicyPowerOfTwo:
 		return NewPowerOfTwoBalancer(targets)
-	case router.PolicyConsistentHash, router.PolicyCacheAware, router.PolicyRendezvousHash:
+	case router.PolicyConsistentHash:
 		return NewConsistentHashBalancer(targets, 100)
+	case router.PolicyCacheAware:
+		return NewCacheAwareBalancer(targets, 100)
+	case router.PolicyRendezvousHash:
+		return NewRendezvousHashBalancer(targets)
 	default:
 		return NewRoundRobinBalancer(targets)
 	}
 }
+
