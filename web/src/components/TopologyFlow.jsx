@@ -5,84 +5,99 @@ export default function TopologyFlow({ data }) {
 
   if (models.length === 0) {
     return (
-      <section className="section-card">
-        <div className="section-header">
-          <span className="section-title">🌐 多模型路由架构拓扑流 (Model Routing Architecture Topology)</span>
-          <span className="badge badge-blue">动态调度与会话粘性 (X-Session-ID)</span>
+      <section className="glass-panel">
+        <div className="panel-header">
+          <div className="panel-title">
+            <span>🌐</span>
+            <span>多模型路由架构拓扑流 (Model Routing Architecture Topology)</span>
+          </div>
+          <span className="badge-pill pill-blue">动态调度与会话粘性</span>
         </div>
-        <div className="topology-container" style={{ textAlign: 'center', color: 'var(--text-dim)' }}>
-          集群内暂未发现运行中的模型与 Worker 实例
+        <div className="topology-canvas" style={{ textAlign: 'center', padding: '48px', color: 'var(--text-dim)' }}>
+          GPUStack 集群内暂未发现运行中的模型与 Worker 实例，等待后端同步...
         </div>
       </section>
     );
   }
 
-  // Collect worker nodes for visual stage (up to 4)
+  // Collect worker nodes for visual preview stage
   const previewWorkers = [];
   models.forEach((m) => {
     (m.workers || []).forEach((w) => {
-      if (previewWorkers.length < 4) {
+      if (previewWorkers.length < 5) {
         previewWorkers.push({ ...w, modelName: m.model_name });
       }
     });
   });
 
   return (
-    <section className="section-card">
-      <div className="section-header">
-        <span className="section-title">🌐 多模型路由架构拓扑流 (Model Routing Architecture Topology)</span>
-        <span className="badge badge-blue">动态调度与会话粘性 (X-Session-ID)</span>
+    <section className="glass-panel">
+      <div className="panel-header">
+        <div className="panel-title">
+          <span>🌐</span>
+          <span>多模型路由架构拓扑流 (Model Routing Architecture Topology)</span>
+        </div>
+        <span className="badge-pill pill-blue">会话前缀粘性 (X-Session-ID)</span>
       </div>
-      <div className="topology-container">
+
+      <div className="topology-canvas">
         <div className="topo-flow">
-          {/* Stage 1: Clients */}
+          {/* Stage 1: Client Applications */}
           <div className="topo-stage">
-            <div className="topo-stage-header">1. 业务客户端调用层</div>
+            <div className="topo-stage-header">1. 业务接入层 (Clients)</div>
             <div className="topo-node">
               <div className="topo-node-title">
-                <span>📱 Client Apps / WebUI</span>
-                <span className="badge badge-blue">REST / SSE</span>
+                <span>📱 业务端 / 客户端</span>
+                <span className="badge-pill pill-blue">REST / SSE</span>
               </div>
               <div className="topo-node-meta">
                 POST /v1/chat/completions<br />
-                X-Session-ID: 会话粘性
+                支持 X-Session-ID 前缀粘性
               </div>
             </div>
           </div>
 
           <div className="topo-arrow">➔</div>
 
-          {/* Stage 2: Gateway */}
+          {/* Stage 2: Gateway & Consistent Hash Core */}
           <div className="topo-stage">
-            <div className="topo-stage-header">2. 动态路由调度核心</div>
-            <div className="topo-node" style={{ borderColor: 'var(--accent-blue)' }}>
+            <div className="topo-stage-header">2. 调度网关核心 (Router Core)</div>
+            <div className="topo-node" style={{ borderColor: 'var(--apple-blue)', boxShadow: '0 4px 18px rgba(0, 113, 227, 0.12)' }}>
               <div className="topo-node-title">
-                <span>🚀 gpu-vllm-router</span>
-                <span className="badge badge-green">{(data?.mode || 'proxy').toUpperCase()}</span>
+                <span>⚡ gpu-vllm-router</span>
+                <span className="badge-pill pill-green">{(data?.mode || 'proxy').toUpperCase()}</span>
               </div>
               <div className="topo-node-meta">
-                监听地址: {data?.public_addr || '0.0.0.0:8000'}<br />
+                监听端点: {data?.public_addr || '0.0.0.0:8000'}<br />
                 负载策略: {data?.policy || 'consistent_hash'}<br />
-                总并发: {data?.total_active_conns || 0} reqs
+                活跃并发: {data?.total_active_conns || 0} reqs
               </div>
             </div>
           </div>
 
           <div className="topo-arrow">➔</div>
 
-          {/* Stage 3: Models */}
+          {/* Stage 3: Models Route Pool */}
           <div className="topo-stage">
             <div className="topo-stage-header">3. 模型路由池 ({models.length} Models)</div>
             {models.map((m) => (
               <div key={m.model_name} className="topo-node">
                 <div className="topo-node-title">
-                  <span style={{ maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {m.model_name}
+                  <span
+                    style={{
+                      maxWidth: '150px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={m.model_name}
+                  >
+                    🧠 {m.model_name}
                   </span>
-                  <span className="badge badge-blue">{m.worker_count} 节点</span>
+                  <span className="badge-pill pill-blue">{m.worker_count} 实例</span>
                 </div>
                 <div className="topo-node-meta">
-                  活跃连接: {m.active_conns || 0} | 策略: {m.policy}
+                  并发: {m.active_conns || 0} | 健康: {m.healthy_count}/{m.worker_count}
                 </div>
               </div>
             ))}
@@ -90,30 +105,47 @@ export default function TopologyFlow({ data }) {
 
           <div className="topo-arrow">➔</div>
 
-          {/* Stage 4: Workers */}
+          {/* Stage 4: vLLM Backend Workers */}
           <div className="topo-stage">
-            <div className="topo-stage-header">4. 推理 Worker 节点 ({data?.total_workers || 0} Instances)</div>
+            <div className="topo-stage-header">
+              4. 推理 Worker 实例 ({data?.total_workers || 0} Nodes)
+            </div>
             {previewWorkers.map((w, idx) => {
               const isClosed = w.circuit_state === 'CLOSED' || w.healthy;
-              const badgeClass = isClosed ? 'badge-green' : (w.circuit_state === 'HALF_OPEN' ? 'badge-amber' : 'badge-red');
+              const pillClass = isClosed
+                ? 'pill-green'
+                : w.circuit_state === 'HALF_OPEN'
+                ? 'pill-amber'
+                : 'pill-red';
               const stateStr = w.circuit_state || (w.healthy ? 'CLOSED' : 'OPEN');
+
               return (
-                <div
-                  key={idx}
-                  className="topo-node"
-                  style={{ borderColor: isClosed ? 'rgba(16, 185, 129, 0.4)' : 'rgba(239, 68, 68, 0.4)' }}
-                >
+                <div key={idx} className="topo-node">
                   <div className="topo-node-title">
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>{w.url}</span>
-                    <span className={`badge ${badgeClass}`}>{stateStr}</span>
+                    <span
+                      style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '11px',
+                        maxWidth: '140px',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title={w.url}
+                    >
+                      {w.url.replace('http://', '')}
+                    </span>
+                    <span className={`badge-pill ${pillClass}`}>{stateStr}</span>
                   </div>
-                  <div className="topo-node-meta">并发负载: {w.active_conns} reqs</div>
+                  <div className="topo-node-meta">
+                    并发: {w.active_conns || 0} | 连续失败: {w.consecutive_failures || 0}
+                  </div>
                 </div>
               );
             })}
-            {(data?.total_workers || 0) > 4 && (
+            {(data?.total_workers || 0) > previewWorkers.length && (
               <div style={{ fontSize: '11px', color: 'var(--text-dim)', textAlign: 'center' }}>
-                ... 及其余 {(data?.total_workers || 0) - 4} 个节点 (见下方明细)
+                + 另有 {(data?.total_workers || 0) - previewWorkers.length} 个 Worker (见负载视图)
               </div>
             )}
           </div>
