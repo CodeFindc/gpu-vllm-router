@@ -353,9 +353,12 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	mux.Handle("/dashboard", dashHandler)
 	mux.Handle("/ui/", dashHandler)
 	mux.Handle("/ui", dashHandler)
+	mux.Handle("/api/", dashHandler)
 	mux.Handle("/api/topology", dashHandler)
 	mux.Handle("/api/probe", dashHandler)
 	mux.Handle("/api/reset-breaker", dashHandler)
+	mux.Handle("/api/config", dashHandler)
+	mux.Handle("/api/models/rule", dashHandler)
 	mux.Handle("/api/health", dashHandler)
 	mux.HandleFunc("/", s.handleProxy)
 
@@ -602,6 +605,13 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	// Redirect root browser requests to /dashboard
 	if req.URL.Path == "/" && req.Method == http.MethodGet && req.URL.Query().Get("model") == "" {
 		http.Redirect(w, req, "/dashboard", http.StatusFound)
+		return
+	}
+
+	// Safeguard for internal dashboard REST APIs
+	if strings.HasPrefix(req.URL.Path, "/api/") {
+		dashHandler := dashboard.NewHandler(s)
+		dashHandler.ServeHTTP(w, req)
 		return
 	}
 

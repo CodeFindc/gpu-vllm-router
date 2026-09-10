@@ -437,15 +437,22 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.Handle("/dashboard", dashHandler)
 	mux.Handle("/ui/", dashHandler)
 	mux.Handle("/ui", dashHandler)
+	mux.Handle("/api/", dashHandler)
 	mux.Handle("/api/topology", dashHandler)
 	mux.Handle("/api/probe", dashHandler)
 	mux.Handle("/api/reset-breaker", dashHandler)
+	mux.Handle("/api/config", dashHandler)
+	mux.Handle("/api/models/rule", dashHandler)
 	mux.Handle("/api/health", dashHandler)
 
 	// Root handler with smart browser redirect to /dashboard
 	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" && r.Method == http.MethodGet && r.URL.Query().Get("model") == "" {
 			http.Redirect(w, r, "/dashboard", http.StatusFound)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			dashHandler.ServeHTTP(w, r)
 			return
 		}
 		s.reverseProxy.ServeHTTP(w, r)

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gpu-vllm-router/pkg/config"
@@ -174,6 +175,18 @@ func TestProxyEndpointsAndTopology(t *testing.T) {
 	_, resetErr := cb.GetLastProbeAndError()
 	if resetErr != "" {
 		t.Errorf("expected lastErr to be cleared after reset, got %s", resetErr)
+	}
+
+	// 6. Test /api/config via dashHandler
+	dashHandler := dashboard.NewHandler(s)
+	rwCfg := httptest.NewRecorder()
+	reqCfg, _ := http.NewRequest(http.MethodGet, "/api/config", nil)
+	dashHandler.ServeHTTP(rwCfg, reqCfg)
+	if rwCfg.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /api/config, got %d", rwCfg.Code)
+	}
+	if !strings.Contains(rwCfg.Body.String(), `"mode":"proxy"`) {
+		t.Errorf("expected mode proxy in /api/config, got %s", rwCfg.Body.String())
 	}
 }
 

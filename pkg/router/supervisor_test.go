@@ -258,6 +258,17 @@ func TestSupervisorEndpointsAndRedirect(t *testing.T) {
 	if len(topo.Models) != 1 || topo.Models[0].ActiveConns != 3 {
 		t.Errorf("expected model ActiveConns=3, got %v", topo.Models)
 	}
+
+	// 6. Test /api/config via handleProxy safeguard
+	rwCfg := httptest.NewRecorder()
+	reqCfg, _ := http.NewRequest(http.MethodGet, "/api/config", nil)
+	sup.handleProxy(rwCfg, reqCfg)
+	if rwCfg.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /api/config, got %d (body: %s)", rwCfg.Code, rwCfg.Body.String())
+	}
+	if !strings.Contains(rwCfg.Body.String(), `"mode":"run"`) {
+		t.Errorf("expected mode run in /api/config response, got %s", rwCfg.Body.String())
+	}
 }
 
 func TestSupervisorConfigManager(t *testing.T) {
