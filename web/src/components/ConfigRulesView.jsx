@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 const POLICY_OPTIONS = [
   { value: 'consistent_hash', label: '一致性哈希 (consistent_hash) - 会话保持，高 Cache 命中率' },
@@ -7,12 +7,13 @@ const POLICY_OPTIONS = [
   { value: 'random', label: '随机分发 (random) - 无状态快速打散' },
 ];
 
-export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }) {
+export default function ConfigRulesView({ clusterModels = [], onRefreshTopology, showToast, onCopy }) {
   const [config, setConfig] = useState(null);
   const [models, setModels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [hasChanges, setHasChanges] = useState(false);
+  const [loadError, setLoadError] = useState(null);
 
   // Form State
   const [globalMode, setGlobalMode] = useState('proxy');
@@ -32,48 +33,77 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
   // Per-Model Rules: map of modelName -> { mode: '', policy: '' }
   const [modelRules, setModelRules] = useState({});
 
-  const loadConfig = useCallback(async (quiet = false) => {
+  // Use ref to keep track of hasChanges without triggering effect dependencies
+  const hasChangesRef = useRef(false);
+  hasChangesRef.current = hasChanges;
+
+  const loadConfig = async (isManual = false) => {
     try {
-      if (!quiet) setLoading(true);
+      if (isManual || !config) setLoading(true);
+      setLoadError(null);
       const resp = await fetch('/api/config');
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+      }
       const data = await resp.json();
       setConfig(data);
 
-      setGlobalMode(data.mode || 'proxy');
-      setGlobalPolicy(data.policy || 'consistent_hash');
-      setWatchInterval(data.watch_interval_secs || 10);
-      setZeroDowntime(data.zero_downtime !== false);
-      setDrainTimeout(data.drain_timeout_secs || 60);
+      // Only update form fields if user does not have uncommitted changes
+      if (!hasChangesRef.current || isManual) {
+        setGlobalMode(data.mode || 'proxy');
+        setGlobalPolicy(data.policy || 'consistent_hash');
+        setWatchInterval(data.watch_interval_secs || 10);
+        setZeroDowntime(data.zero_downtime !== false);
+        setDrainTimeout(data.drain_timeout_secs || 60);
 
-      setCbEnabled(data.circuit_breaker_enabled !== false);
-      setCbMaxFailures(data.max_failures || 3);
-      setCbCooldown(data.cooldown_secs || 10);
-      setCbMaxRetries(data.max_retries !== undefined ? data.max_retries : 2);
-      setCbHealthCheckInterval(data.health_check_interval_secs || 3);
-      setCbSuccessThreshold(data.success_threshold || 2);
+        setCbEnabled(data.circuit_breaker_enabled !== false);
+        setCbMaxFailures(data.max_failures || 3);
+        setCbCooldown(data.cooldown_secs || 10);
+        setCbMaxRetries(data.max_retries !== undefined ? data.max_retries : 2);
+        setCbHealthCheckInterval(data.health_check_interval_secs || 3);
+        setCbSuccessThreshold(data.success_threshold || 2);
 
-      const rulesMap = {};
-      (data.models || []).forEach((m) => {
-        rulesMap[m.model_name] = {
-          mode: m.mode || '',
-          policy: m.policy || '',
-        };
-      });
-      setModelRules(rulesMap);
-      setModels(data.models || []);
-      setHasChanges(false);
+        const rulesMap = {};
+        (data.models || []).forEach((m) => {
+          rulesMap[m.model_name] = {
+            mode: m.mode || '',
+            policy: m.policy || '',
+          };
+        });
+
+        // Merge any models discovered in cluster topology
+        if (clusterModels && clusterModels.length > 0) {
+          clusterModels.forEach((cm) => {
+            if (!rulesMap[cm.model_name]) {
+              rulesMap[cm.model_name] = {
+                mode: cm.mode || '',
+                policy: cm.policy || '',
+              };
+            }
+          });
+        }
+
+        setModelRules(rulesMap);
+        setModels(data.models || []);
+        setHasChanges(false);
+      }
+
+      if (isManual && showToast) {
+        showToast('✅ 配置已重新读取并载入');
+      }
     } catch (err) {
       console.error('Failed to load config:', err);
-      showToast(`❌ 加载系统配置失败: ${err.message}`, true);
+      setLoadError(err.message);
     } finally {
-      if (!quiet) setLoading(false);
+      setLoading(false);
     }
-  }, [showToast]);
+  };
 
+  // Mount effect: execute once on mount!
   useEffect(() => {
-    loadConfig();
-  }, [loadConfig]);
+    loadConfig(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleModelRuleChange = (modelName, field, value) => {
     setModelRules((prev) => ({
@@ -102,11 +132,10 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
       if (!resp.ok || !res.success) {
         throw new Error(res.message || '更新失败');
       }
-      showToast(`✅ 模型 ${modelName} 规则已更新并热生效`);
-      onRefreshTopology();
-      loadConfig(true);
+      if (showToast) showToast(`✅ 模型 ${modelName} 规则已更新并热生效`);
+      if (onRefreshTopology) onRefreshTopology();
     } catch (err) {
-      showToast(`❌ 更新模型规则失败: ${err.message}`, true);
+      if (showToast) showToast(`❌ 更新模型规则失败: ${err.message}`, true);
     }
   };
 
@@ -144,13 +173,12 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
         throw new Error(res.message || '保存失败');
       }
 
-      showToast(`✅ 配置已成功保存并实时热生效`);
+      if (showToast) showToast(`✅ 配置已成功保存并实时热生效`);
       setHasChanges(false);
-      onRefreshTopology();
-      loadConfig(true);
+      if (onRefreshTopology) onRefreshTopology();
     } catch (err) {
       console.error('Failed to save config:', err);
-      showToast(`❌ 保存配置失败: ${err.message}`, true);
+      if (showToast) showToast(`❌ 保存配置失败: ${err.message}`, true);
     } finally {
       setSaving(false);
     }
@@ -158,7 +186,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
 
   const generateYamlPreview = () => {
     const lines = [
-      '# 实时生成的 gpu-vllm-router 配置',
+      '# 实时生成的 gpu-vllm-router 配置文件 (config.yaml)',
       'router:',
       `  mode: "${globalMode}"`,
       `  host: "0.0.0.0"`,
@@ -183,7 +211,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
 
     const modelKeys = Object.keys(modelRules);
     if (modelKeys.length === 0) {
-      lines.push('  # 暂无自定义单模型规则 (全部继承全局配置)');
+      lines.push('  # 暂无单独模型规则覆盖 (默认全部继承全局配置)');
     } else {
       modelKeys.forEach((m) => {
         const r = modelRules[m];
@@ -196,12 +224,44 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
     return lines.join('\n');
   };
 
-  if (loading) {
+  // Combine model names from config, cluster topology, and user-edited modelRules
+  const allModelNames = Array.from(new Set([
+    ...models.map((m) => m.model_name),
+    ...clusterModels.map((cm) => cm.model_name),
+    ...Object.keys(modelRules),
+  ])).filter(Boolean);
+
+  // Initial loading view (only when no config has ever loaded)
+  if (loading && !config && !loadError) {
     return (
       <section className="glass-panel">
         <div style={{ textAlign: 'center', padding: '64px', color: 'var(--text-muted)' }}>
-          <span style={{ fontSize: '24px', display: 'block', marginBottom: '12px' }}>⏳</span>
-          正在读取系统动态配置与模型规则...
+          <span style={{ fontSize: '28px', display: 'block', marginBottom: '12px' }}>⏳</span>
+          正在初次读取系统动态配置与模型规则...
+        </div>
+      </section>
+    );
+  }
+
+  // Load error view with friendly in-place retry button
+  if (loadError && !config) {
+    return (
+      <section className="glass-panel" style={{ padding: '36px 24px' }}>
+        <div style={{ textAlign: 'center', maxWidth: '520px', margin: '0 auto' }}>
+          <span style={{ fontSize: '36px', display: 'block', marginBottom: '14px' }}>⚠️</span>
+          <h3 style={{ fontSize: '16px', fontWeight: 700, color: 'var(--apple-red)', marginBottom: '8px' }}>
+            无法载入系统动态配置 (/api/config)
+          </h3>
+          <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px', lineHeight: 1.5 }}>
+            路由器服务暂时未响应或返回错误: {loadError}。请检查路由器进程是否运行。
+          </p>
+          <button
+            className="btn-send"
+            style={{ margin: '0 auto', padding: '8px 24px' }}
+            onClick={() => loadConfig(true)}
+          >
+            🔄 重新尝试读取
+          </button>
         </div>
       </section>
     );
@@ -230,7 +290,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <button
               className="action-btn"
-              onClick={() => loadConfig()}
+              onClick={() => loadConfig(true)}
               disabled={saving}
               title="放弃修改并重新载入服务器配置"
             >
@@ -238,7 +298,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
             </button>
             <button
               className="action-btn"
-              onClick={() => onCopy(generateYamlPreview())}
+              onClick={() => onCopy && onCopy(generateYamlPreview())}
               title="复制当前设置对应的 YAML 格式文本"
             >
               📋 复制 YAML
@@ -448,7 +508,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
             <span>🧠</span>
             <span>多模型独立运行模式与策略规则矩阵 (Per-Model Rules Matrix)</span>
           </div>
-          <span className="badge-pill pill-purple">共纳管 {models.length} 个模型池</span>
+          <span className="badge-pill pill-purple">共纳管 {allModelNames.length} 个模型池</span>
         </div>
 
         <div className="workers-table-wrapper" style={{ marginTop: '12px' }}>
@@ -463,22 +523,22 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
               </tr>
             </thead>
             <tbody>
-              {models.length === 0 ? (
+              {allModelNames.length === 0 ? (
                 <tr>
                   <td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-dim)', padding: '32px' }}>
                     未在集群中发现活动模型
                   </td>
                 </tr>
               ) : (
-                models.map((m) => {
-                  const rule = modelRules[m.model_name] || { mode: '', policy: '' };
+                allModelNames.map((modelName) => {
+                  const rule = modelRules[modelName] || { mode: '', policy: '' };
                   const effectiveMode = rule.mode || globalMode;
                   const effectivePolicy = rule.policy || globalPolicy;
 
                   return (
-                    <tr key={m.model_name}>
+                    <tr key={modelName}>
                       <td style={{ fontWeight: 600 }}>
-                        <span>🧠 {m.model_name}</span>
+                        <span>🧠 {modelName}</span>
                       </td>
 
                       <td>
@@ -486,7 +546,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
                           className="play-select"
                           style={{ padding: '6px 10px', fontSize: '12px' }}
                           value={rule.mode}
-                          onChange={(e) => handleModelRuleChange(m.model_name, 'mode', e.target.value)}
+                          onChange={(e) => handleModelRuleChange(modelName, 'mode', e.target.value)}
                         >
                           <option value="">⚙️ 继承全局 ({globalMode === 'run' ? 'run 官方' : 'proxy 代理'})</option>
                           <option value="proxy">⚡ Go 原生代理 (proxy)</option>
@@ -499,7 +559,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
                           className="play-select"
                           style={{ padding: '6px 10px', fontSize: '12px' }}
                           value={rule.policy}
-                          onChange={(e) => handleModelRuleChange(m.model_name, 'policy', e.target.value)}
+                          onChange={(e) => handleModelRuleChange(modelName, 'policy', e.target.value)}
                         >
                           <option value="">⚙️ 继承全局 ({globalPolicy})</option>
                           <option value="consistent_hash">一致性哈希 (consistent_hash)</option>
@@ -527,7 +587,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
                         <button
                           className="action-btn"
                           style={{ fontSize: '11px', padding: '4px 8px' }}
-                          onClick={() => handleSaveSingleModel(m.model_name)}
+                          onClick={() => handleSaveSingleModel(modelName)}
                           title="立即单独应用此模型的规则变更"
                         >
                           单独应用
@@ -552,7 +612,7 @@ export default function ConfigRulesView({ onRefreshTopology, showToast, onCopy }
           <button
             className="action-btn"
             style={{ fontSize: '12px' }}
-            onClick={() => onCopy(generateYamlPreview())}
+            onClick={() => onCopy && onCopy(generateYamlPreview())}
           >
             📋 复制配置文本
           </button>

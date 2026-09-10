@@ -16,10 +16,10 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState('');
   const [toast, setToast] = useState(null);
 
-  const showToast = (message, isError = false) => {
+  const showToast = useCallback((message, isError = false) => {
     setToast({ message, isError });
     setTimeout(() => setToast(null), 3000);
-  };
+  }, []);
 
   const fetchTopology = useCallback(async (manual = false) => {
     try {
@@ -34,7 +34,7 @@ export default function App() {
       console.error('Fetch topology error:', err);
       if (manual) showToast(`❌ 获取拓扑失败: ${err.message}`, true);
     }
-  }, []);
+  }, [showToast]);
 
   useEffect(() => {
     fetchTopology();
@@ -44,7 +44,7 @@ export default function App() {
     }
   }, [refreshMs, fetchTopology]);
 
-  const handleProbe = async (url) => {
+  const handleProbe = useCallback(async (url) => {
     try {
       const resp = await fetch('/api/probe', {
         method: 'POST',
@@ -61,9 +61,9 @@ export default function App() {
     } catch (err) {
       showToast(`❌ 探针请求异常: ${err.message}`, true);
     }
-  };
+  }, [fetchTopology, showToast]);
 
-  const handleReset = async (url) => {
+  const handleReset = useCallback(async (url) => {
     try {
       const resp = await fetch('/api/reset-breaker', {
         method: 'POST',
@@ -76,9 +76,9 @@ export default function App() {
     } catch (err) {
       showToast(`❌ 重置请求异常: ${err.message}`, true);
     }
-  };
+  }, [fetchTopology, showToast]);
 
-  const handleQuickSwitchMode = async (modelName, targetMode) => {
+  const handleQuickSwitchMode = useCallback(async (modelName, targetMode) => {
     try {
       const resp = await fetch('/api/models/rule', {
         method: 'POST',
@@ -97,13 +97,13 @@ export default function App() {
     } catch (err) {
       showToast(`❌ 模式切换失败: ${err.message}`, true);
     }
-  };
+  }, [fetchTopology, showToast]);
 
-  const handleCopy = (text) => {
+  const handleCopy = useCallback((text) => {
     navigator.clipboard.writeText(text).then(() => {
       showToast(`📋 内容已复制到剪贴板`);
     });
-  };
+  }, [showToast]);
 
   // Filter models based on search query
   const filteredModels = (data?.models || []).filter((m) => {
@@ -167,6 +167,7 @@ export default function App() {
           {/* Tab 3: Rules and Mode Configuration */}
           {activeTab === 'rules' && (
             <ConfigRulesView
+              clusterModels={data?.models || []}
               onRefreshTopology={fetchTopology}
               showToast={showToast}
               onCopy={handleCopy}
