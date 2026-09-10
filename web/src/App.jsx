@@ -120,7 +120,7 @@ export default function App() {
           {/* Tab 1: Topology Architecture */}
           {activeTab === 'topology' && (
             <>
-              <TopologyFlow data={data} />
+              <TopologyFlow data={data} onCopy={handleCopy} />
               <ModelsMatrix
                 models={filteredModels}
                 onProbe={handleProbe}

@@ -444,46 +444,116 @@ body {
 
 /* Topology Flow Canvas - Light Frosted Aesthetic */
 .topology-canvas {
-  padding: 28px;
-  background: radial-gradient(circle at center, rgba(255,255,255,0.8) 0%, rgba(241, 245, 249, 0.6) 100%);
+  padding: 22px 24px;
+  background: radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.95) 0%, rgba(241, 245, 249, 0.6) 100%);
   overflow-x: auto;
 }
 .topo-flow {
   display: flex;
-  align-items: center;
-  justify-content: space-around;
-  gap: 20px;
-  min-width: 860px;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 14px;
+  min-width: 960px;
+  width: 100%;
 }
 .topo-stage {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 14px;
-  flex: 1;
+  gap: 10px;
 }
+
+/* Balanced Proportional Widths for Stages */
+.topo-stage-clients {
+  width: 200px;
+  min-width: 200px;
+  flex-shrink: 0;
+}
+.topo-stage-router {
+  width: 230px;
+  min-width: 230px;
+  flex-shrink: 0;
+}
+.topo-stage-models {
+  width: 260px;
+  min-width: 260px;
+  flex-shrink: 0;
+}
+.topo-stage-workers {
+  flex: 1;
+  min-width: 320px;
+}
+
 .topo-stage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px 6px 4px;
+  border-bottom: 1.5px solid rgba(226, 232, 240, 0.7);
+  margin-bottom: 2px;
+}
+.topo-stage-title {
   font-size: 11px;
   font-weight: 700;
   color: var(--apple-blue);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
+.topo-stage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+/* Connector Arrow between stages */
+.topo-connector {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-top: 46px;
+  flex-shrink: 0;
+  width: 20px;
+}
+.topo-arrow {
+  font-size: 15px;
+  color: var(--text-dim);
+  line-height: 1;
+  animation: pulseArrow 2s infinite ease-in-out;
+}
+@keyframes pulseArrow {
+  0%, 100% { opacity: 0.35; transform: translateX(0); }
+  50% { opacity: 1; color: var(--apple-blue); transform: translateX(3px); }
+}
+
+/* Topology Node Cards */
 .topo-node {
-  background: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.92);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid rgba(226, 232, 240, 0.9);
   border-radius: 12px;
-  padding: 14px 16px;
-  width: 100%;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.04);
+  padding: 12px 14px;
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.03);
   transition: all 0.2s ease;
+  position: relative;
+  width: 100%;
 }
 .topo-node:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.07);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
   border-color: var(--apple-blue);
+}
+.topo-node.active-selected {
+  border-color: var(--apple-blue);
+  box-shadow: 0 0 0 2px rgba(0, 113, 227, 0.25), 0 8px 20px rgba(0, 113, 227, 0.08);
+  background: #ffffff;
+}
+.topo-node-clickable {
+  cursor: pointer;
 }
 .topo-node-title {
   font-size: 13px;
@@ -492,21 +562,27 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 6px;
+}
+.topo-node-name {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+  line-height: 1.35;
 }
 .topo-node-meta {
   font-size: 11px;
   color: var(--text-muted);
-  font-family: var(--font-mono);
+  line-height: 1.5;
 }
-.topo-arrow {
-  font-size: 20px;
-  color: var(--text-dim);
-  animation: pulseArrow 2s infinite ease-in-out;
-}
-@keyframes pulseArrow {
-  0%, 100% { opacity: 0.4; transform: translateX(0); }
-  50% { opacity: 1; color: var(--apple-blue); transform: translateX(4px); }
+
+/* Mini Load Bar inside Topology Worker Card */
+.topo-worker-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
 }
 
 /* Models & Workers Table */
