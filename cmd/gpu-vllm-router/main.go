@@ -282,6 +282,14 @@ func main() {
 			WatchInterval: *watchInterval,
 			RouterCfg:     routerCfg,
 		}
+		if fileCfg != nil {
+			if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
+				supCfg.WorkerProbeInterval = fileCfg.CircuitBreaker.HealthCheckInterval
+			}
+			if fileCfg.CircuitBreaker.MaxFailures > 0 {
+				supCfg.WorkerMaxFailures = fileCfg.CircuitBreaker.MaxFailures
+			}
+		}
 		sup := router.NewSupervisor(client, *modelName, supCfg)
 		if err := sup.Start(ctx); err != nil {
 			log.Fatalf("启动 vllm-router 守护进程失败: %v", err)

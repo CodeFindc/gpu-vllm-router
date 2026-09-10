@@ -23,14 +23,26 @@ import (
 	"gpu-vllm-router/pkg/gpustack"
 )
 
+// WorkerBreaker tracks health and circuit breaker status of a backend worker instance in mode: run.
+type WorkerBreaker struct {
+	URL              string    `json:"url"`
+	ConsecutiveFails int       `json:"consecutive_fails"`
+	LastProbe        time.Time `json:"last_probe"`
+	LastErr          string    `json:"last_error,omitempty"`
+	Healthy          bool      `json:"healthy"`
+	OpenSince        time.Time `json:"open_since,omitempty"`
+}
+
 // SupervisorConfig defines configuration for the router supervisor.
 type SupervisorConfig struct {
-	ZeroDowntime       bool
-	PublicHost         string
-	PublicPort         int
-	DrainTimeout       time.Duration
-	HealthCheckTimeout time.Duration
-	WatchInterval      time.Duration
+	ZeroDowntime        bool
+	PublicHost          string
+	PublicPort          int
+	DrainTimeout        time.Duration
+	HealthCheckTimeout  time.Duration
+	WatchInterval       time.Duration
+	WorkerProbeInterval time.Duration
+	WorkerMaxFailures   int
 
 	RouterCfg Config
 }
@@ -48,6 +60,8 @@ type ModelRunner struct {
 	CurrentProc  *runningProcess
 	ActiveTarget *url.URL
 	ActiveURLs   []string
+	AllURLs      []string
+	reloading    bool
 }
 
 // Supervisor oversees vllm-router instances with zero-downtime rolling reload.
@@ -64,8 +78,15 @@ type Supervisor struct {
 	activeTarget *url.URL         // for backward compatibility & single-model direct access
 	activeURLs   []string         // for backward compatibility & single-model direct access
 
+	workerMu     sync.RWMutex
+	workerStates map[string]*WorkerBreaker
+
 	frontServer *http.Server
 	stopCh      chan struct{}
+
+	spawnProcessFunc  func(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error)
+	probeWorkerFunc   func(ctx context.Context, rawURL string) (bool, error)
+	waitForHealthFunc func(ctx context.Context, port int, timeout time.Duration) error
 }
 
 // NewSupervisor creates a new Supervisor instance.
@@ -85,13 +106,34 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 	if cfg.HealthCheckTimeout <= 0 {
 		cfg.HealthCheckTimeout = 30 * time.Second
 	}
+	if cfg.WorkerProbeInterval <= 0 {
+		cfg.WorkerProbeInterval = 3 * time.Second
+	}
+	if cfg.WorkerMaxFailures <= 0 {
+		cfg.WorkerMaxFailures = 3
+	}
 
 	return &Supervisor{
-		client:    client,
-		modelName: modelName,
-		cfg:       cfg,
-		runners:   make(map[string]*ModelRunner),
-		stopCh:    make(chan struct{}),
+		client:       client,
+		modelName:    modelName,
+		cfg:          cfg,
+		runners:      make(map[string]*ModelRunner),
+		workerStates: make(map[string]*WorkerBreaker),
+		stopCh:       make(chan struct{}),
+	}
+}
+
+func (s *Supervisor) initWorkers(urls []string) {
+	s.workerMu.Lock()
+	defer s.workerMu.Unlock()
+	for _, u := range urls {
+		if _, exists := s.workerStates[u]; !exists {
+			s.workerStates[u] = &WorkerBreaker{
+				URL:       u,
+				Healthy:   true,
+				LastProbe: time.Now(),
+			}
+		}
 	}
 }
 
@@ -208,6 +250,9 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to start router for model %s: %w", model.Name, err)
 		}
+		runner.AllURLs = urls
+		s.initWorkers(urls)
+
 		s.mu.Lock()
 		s.runners[model.Name] = runner
 		s.currentProc = runner.CurrentProc
@@ -239,6 +284,9 @@ func (s *Supervisor) Start(ctx context.Context) error {
 				log.Printf("[Supervisor] Warning: failed to start router for model %q: %v", mName, err)
 				continue
 			}
+			runner.AllURLs = urls
+			s.initWorkers(urls)
+
 			s.mu.Lock()
 			s.runners[mName] = runner
 			if s.activeTarget == nil {
@@ -262,6 +310,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/admin/supervisor", s.handleSupervisorStatus)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/", s.handleProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.PublicPort)
@@ -278,9 +327,17 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Start dynamic watch loop
+	// Start dynamic watch loop and proactive worker probe loop
 	go s.watchLoop(ctx)
+	go s.workerProbeLoop(ctx)
 	return nil
+}
+
+func (s *Supervisor) doSpawn(ctx context.Context, host string, port int, workerURLs []string) (*runningProcess, error) {
+	if s.spawnProcessFunc != nil {
+		return s.spawnProcessFunc(ctx, host, port, workerURLs)
+	}
+	return s.spawnProcess(ctx, host, port, workerURLs)
 }
 
 func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, workerURLs []string) (*ModelRunner, error) {
@@ -291,14 +348,14 @@ func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, wor
 
 	log.Printf("[Supervisor] Launching vllm-router process for [%s] on internal port %d (Workers: %d)...",
 		modelName, internalPort, len(workerURLs))
-	proc, err := s.spawnProcess(ctx, "127.0.0.1", internalPort, workerURLs)
+	proc, err := s.doSpawn(ctx, "127.0.0.1", internalPort, workerURLs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to spawn router process for %s: %w", modelName, err)
 	}
 
 	// Wait for process readiness
-	if err := s.waitForHealth(ctx, internalPort, s.cfg.HealthCheckTimeout); err != nil {
-		if proc.cmd.Process != nil {
+	if err := s.checkHealth(ctx, internalPort, s.cfg.HealthCheckTimeout); err != nil {
+		if proc != nil && proc.cmd != nil && proc.cmd.Process != nil {
 			_ = proc.cmd.Process.Kill()
 		}
 		return nil, fmt.Errorf("health check failed on internal port %d for model %s: %w", internalPort, modelName, err)
@@ -309,6 +366,7 @@ func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, wor
 		CurrentProc:  proc,
 		ActiveTarget: proc.targetURL,
 		ActiveURLs:   workerURLs,
+		AllURLs:      workerURLs,
 	}, nil
 }
 
@@ -369,21 +427,95 @@ func (s *Supervisor) handleSupervisorStatus(w http.ResponseWriter, r *http.Reque
 			"target":        targetStr,
 			"worker_count":  len(runner.ActiveURLs),
 			"worker_urls":   runner.ActiveURLs,
+			"all_urls":      runner.AllURLs,
+			"reloading":     runner.reloading,
 		}
 		runner.mu.RUnlock()
 	}
 
+	s.workerMu.RLock()
+	workersMap := make(map[string]interface{})
+	for u, wb := range s.workerStates {
+		openSinceStr := ""
+		if !wb.OpenSince.IsZero() {
+			openSinceStr = wb.OpenSince.Format(time.RFC3339)
+		}
+		workersMap[u] = map[string]interface{}{
+			"healthy":           wb.Healthy,
+			"consecutive_fails": wb.ConsecutiveFails,
+			"last_probe":        wb.LastProbe.Format(time.RFC3339),
+			"last_error":        wb.LastErr,
+			"open_since":        openSinceStr,
+		}
+	}
+	s.workerMu.RUnlock()
+
 	resp := map[string]interface{}{
+		"mode":          "supervisor_run_mode",
 		"multi_model":   s.modelName == "",
 		"public_port":   s.cfg.PublicPort,
 		"model_count":   len(s.runners),
 		"drain_timeout": s.cfg.DrainTimeout.String(),
 		"zero_downtime": s.cfg.ZeroDowntime,
-		"models":        modelsMap,
+		"probe_config": map[string]interface{}{
+			"interval":     s.cfg.WorkerProbeInterval.String(),
+			"max_failures": s.cfg.WorkerMaxFailures,
+		},
+		"models":  modelsMap,
+		"workers": workersMap,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleMetrics provides Prometheus-formatted metrics for Supervisor in mode: run.
+func (s *Supervisor) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	modelCount := len(s.runners)
+	runners := make([]*ModelRunner, 0, modelCount)
+	for _, r := range s.runners {
+		runners = append(runners, r)
+	}
+	s.mu.RUnlock()
+
+	s.workerMu.RLock()
+	workers := make(map[string]WorkerBreaker, len(s.workerStates))
+	for u, wb := range s.workerStates {
+		workers[u] = *wb
+	}
+	s.workerMu.RUnlock()
+
+	var buf bytes.Buffer
+
+	buf.WriteString("# HELP gpu_router_models_total Total number of registered active models\n")
+	buf.WriteString("# TYPE gpu_router_models_total gauge\n")
+	fmt.Fprintf(&buf, "gpu_router_models_total %d\n\n", modelCount)
+
+	buf.WriteString("# HELP gpu_router_workers_total Total number of backend workers tracked by supervisor\n")
+	buf.WriteString("# TYPE gpu_router_workers_total gauge\n")
+	fmt.Fprintf(&buf, "gpu_router_workers_total %d\n\n", len(workers))
+
+	buf.WriteString("# HELP gpu_router_worker_health Health status of worker (1 = healthy, 0 = unhealthy/circuit open)\n")
+	buf.WriteString("# TYPE gpu_router_worker_health gauge\n")
+	for u, wb := range workers {
+		hVal := 0
+		if wb.Healthy {
+			hVal = 1
+		}
+		fmt.Fprintf(&buf, "gpu_router_worker_health{worker=%q} %d\n", u, hVal)
+	}
+	buf.WriteString("\n")
+
+	buf.WriteString("# HELP gpu_router_worker_consecutive_failures Consecutive probe failure count\n")
+	buf.WriteString("# TYPE gpu_router_worker_consecutive_failures gauge\n")
+	for u, wb := range workers {
+		fmt.Fprintf(&buf, "gpu_router_worker_consecutive_failures{worker=%q} %d\n", u, wb.ConsecutiveFails)
+	}
+	buf.WriteString("\n")
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
@@ -427,6 +559,7 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		FlushInterval: 10 * time.Millisecond,
 		ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("[Supervisor:Proxy] Forwarding error for model %s: %v", runner.ModelName, err)
+			go s.fastProbeRunner(runner)
 			rw.WriteHeader(http.StatusBadGateway)
 			_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router gateway error for model %s: %v","type":"bad_gateway"}}`, runner.ModelName, err)))
 		},
@@ -480,9 +613,209 @@ func (s *Supervisor) spawnProcess(ctx context.Context, host string, port int, wo
 	go func() {
 		waitErr := cmd.Wait()
 		log.Printf("%s Process exited: %v", prefix, waitErr)
+		s.handleProcessExit(proc, waitErr)
 	}()
 
 	return proc, nil
+}
+
+func (s *Supervisor) handleProcessExit(proc *runningProcess, waitErr error) {
+	select {
+	case <-s.stopCh:
+		// Supervisor is shutting down, normal termination
+		return
+	default:
+	}
+
+	s.mu.RLock()
+	var crashedRunner *ModelRunner
+	for _, r := range s.runners {
+		r.mu.RLock()
+		if r.CurrentProc == proc {
+			crashedRunner = r
+		}
+		r.mu.RUnlock()
+		if crashedRunner != nil {
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if crashedRunner != nil {
+		log.Printf("[Supervisor:Guard] 🚨 Active vllm-router process on port %d exited unexpectedly (%v)! Initiating emergency auto-respawn for [%s]...",
+			proc.port, waitErr, crashedRunner.ModelName)
+		crashedRunner.mu.RLock()
+		targetURLs := make([]string, len(crashedRunner.ActiveURLs))
+		copy(targetURLs, crashedRunner.ActiveURLs)
+		crashedRunner.mu.RUnlock()
+
+		if len(targetURLs) > 0 {
+			go s.performZeroDowntimeReloadForRunner(context.Background(), crashedRunner, targetURLs)
+		}
+	}
+}
+
+func (s *Supervisor) probeWorker(ctx context.Context, rawURL string) (bool, error) {
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+
+	// 1. Try /health
+	healthURL := strings.TrimRight(rawURL, "/") + "/health"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err == nil {
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true, nil
+			}
+		}
+	}
+
+	// 2. Fallback /v1/models
+	modelsURL := strings.TrimRight(rawURL, "/") + "/v1/models"
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
+	if err == nil {
+		resp, err := client.Do(req2)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true, nil
+			}
+			return false, fmt.Errorf("HTTP status %d", resp.StatusCode)
+		}
+		return false, err
+	}
+	return false, err
+}
+
+func (s *Supervisor) probeRunnerWorkers(ctx context.Context, runner *ModelRunner) {
+	runner.mu.RLock()
+	allURLs := make([]string, len(runner.AllURLs))
+	copy(allURLs, runner.AllURLs)
+	activeURLs := make([]string, len(runner.ActiveURLs))
+	copy(activeURLs, runner.ActiveURLs)
+	runner.mu.RUnlock()
+
+	if len(allURLs) == 0 {
+		return
+	}
+
+	type probeResult struct {
+		url     string
+		healthy bool
+		err     error
+	}
+
+	results := make(chan probeResult, len(allURLs))
+	var wg sync.WaitGroup
+	for _, u := range allURLs {
+		wg.Add(1)
+		go func(targetURL string) {
+			defer wg.Done()
+			var ok bool
+			var err error
+			if s.probeWorkerFunc != nil {
+				ok, err = s.probeWorkerFunc(ctx, targetURL)
+			} else {
+				ok, err = s.probeWorker(ctx, targetURL)
+			}
+			results <- probeResult{url: targetURL, healthy: ok, err: err}
+		}(u)
+	}
+	wg.Wait()
+	close(results)
+
+	s.workerMu.Lock()
+	for res := range results {
+		wb, exists := s.workerStates[res.url]
+		if !exists {
+			wb = &WorkerBreaker{URL: res.url, Healthy: true}
+			s.workerStates[res.url] = wb
+		}
+		wb.LastProbe = time.Now()
+		if res.healthy {
+			if !wb.Healthy {
+				log.Printf("[Supervisor:Breaker] 🟢 Worker %s RECOVERED! Resetting circuit breaker.", res.url)
+			}
+			wb.ConsecutiveFails = 0
+			wb.Healthy = true
+			wb.LastErr = ""
+			wb.OpenSince = time.Time{}
+		} else {
+			wb.ConsecutiveFails++
+			wb.LastErr = fmt.Sprintf("%v", res.err)
+			maxFails := s.cfg.WorkerMaxFailures
+			if maxFails <= 0 {
+				maxFails = 3
+			}
+			if wb.Healthy && wb.ConsecutiveFails >= maxFails {
+				wb.Healthy = false
+				wb.OpenSince = time.Now()
+				log.Printf("[Supervisor:Breaker] 🔴 CIRCUIT BREAKER TRIPPED for worker %s! (%d consecutive failures, last error: %v)",
+					res.url, wb.ConsecutiveFails, res.err)
+			}
+		}
+	}
+
+	var healthyURLs []string
+	for _, u := range allURLs {
+		if wb := s.workerStates[u]; wb != nil && wb.Healthy {
+			healthyURLs = append(healthyURLs, u)
+		}
+	}
+	s.workerMu.Unlock()
+
+	sort.Strings(healthyURLs)
+	sort.Strings(activeURLs)
+
+	if !reflect.DeepEqual(healthyURLs, activeURLs) {
+		if len(healthyURLs) == 0 {
+			log.Printf("[Supervisor:Breaker] ⚠️ CRITICAL: All workers for model %q are unhealthy! Keeping current active router to avoid complete service drop.", runner.ModelName)
+		} else {
+			log.Printf("[Supervisor:Breaker] ⚡ Healthy worker pool changed for model %q! (Active: %d -> Healthy: %d). Triggering immediate zero-downtime rolling reload...",
+				runner.ModelName, len(activeURLs), len(healthyURLs))
+			go s.performZeroDowntimeReloadForRunner(ctx, runner, healthyURLs)
+		}
+	}
+}
+
+func (s *Supervisor) probeAllWorkers(ctx context.Context) {
+	s.mu.RLock()
+	runners := make([]*ModelRunner, 0, len(s.runners))
+	for _, r := range s.runners {
+		runners = append(runners, r)
+	}
+	s.mu.RUnlock()
+
+	for _, r := range runners {
+		s.probeRunnerWorkers(ctx, r)
+	}
+}
+
+func (s *Supervisor) workerProbeLoop(ctx context.Context) {
+	interval := s.cfg.WorkerProbeInterval
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.probeAllWorkers(ctx)
+		}
+	}
+}
+
+func (s *Supervisor) fastProbeRunner(runner *ModelRunner) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.probeRunnerWorkers(ctx, runner)
 }
 
 func streamPipe(r io.Reader, prefix string) {
@@ -490,6 +823,13 @@ func streamPipe(r io.Reader, prefix string) {
 	for scanner.Scan() {
 		log.Printf("%s %s", prefix, scanner.Text())
 	}
+}
+
+func (s *Supervisor) checkHealth(ctx context.Context, port int, timeout time.Duration) error {
+	if s.waitForHealthFunc != nil {
+		return s.waitForHealthFunc(ctx, port, timeout)
+	}
+	return s.waitForHealth(ctx, port, timeout)
 }
 
 func (s *Supervisor) waitForHealth(ctx context.Context, port int, timeout time.Duration) error {
@@ -559,16 +899,37 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 				s.mu.RUnlock()
 
 				if runner != nil {
+					runner.mu.Lock()
+					runner.AllURLs = newURLs
+					runner.mu.Unlock()
+					s.initWorkers(newURLs)
+
+					// Compute healthy subset among newURLs
+					s.workerMu.RLock()
+					var healthyNewURLs []string
+					for _, u := range newURLs {
+						wb, ok := s.workerStates[u]
+						if !ok || wb.Healthy {
+							healthyNewURLs = append(healthyNewURLs, u)
+						}
+					}
+					s.workerMu.RUnlock()
+
+					if len(healthyNewURLs) == 0 {
+						healthyNewURLs = newURLs
+					}
+					sort.Strings(healthyNewURLs)
+
 					runner.mu.RLock()
 					currURLs := runner.ActiveURLs
 					runner.mu.RUnlock()
 
-					if !reflect.DeepEqual(currURLs, newURLs) {
+					if !reflect.DeepEqual(currURLs, healthyNewURLs) {
 						log.Printf("[Supervisor] [Watch] Detected topology change for model %s!", s.modelName)
 						log.Printf("  Previous URLs: %v", currURLs)
-						log.Printf("  New URLs:      %v", newURLs)
-						if len(newURLs) > 0 {
-							s.performZeroDowntimeReloadForRunner(ctx, runner, newURLs)
+						log.Printf("  New URLs:      %v", healthyNewURLs)
+						if len(healthyNewURLs) > 0 {
+							s.performZeroDowntimeReloadForRunner(ctx, runner, healthyNewURLs)
 						}
 					}
 				}
@@ -587,6 +948,7 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 						newURLs = append(newURLs, ep.URL)
 					}
 					sort.Strings(newURLs)
+					s.initWorkers(newURLs)
 
 					s.mu.RLock()
 					runner, exists := s.runners[mName]
@@ -599,20 +961,40 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 							log.Printf("[Supervisor] Failed to spawn router for new model %q: %v", mName, err)
 							continue
 						}
+						newRunner.AllURLs = newURLs
 						s.mu.Lock()
 						s.runners[mName] = newRunner
 						s.mu.Unlock()
 					} else {
+						runner.mu.Lock()
+						runner.AllURLs = newURLs
+						runner.mu.Unlock()
+
+						s.workerMu.RLock()
+						var healthyNewURLs []string
+						for _, u := range newURLs {
+							wb, ok := s.workerStates[u]
+							if !ok || wb.Healthy {
+								healthyNewURLs = append(healthyNewURLs, u)
+							}
+						}
+						s.workerMu.RUnlock()
+
+						if len(healthyNewURLs) == 0 {
+							healthyNewURLs = newURLs
+						}
+						sort.Strings(healthyNewURLs)
+
 						runner.mu.RLock()
 						currURLs := runner.ActiveURLs
 						runner.mu.RUnlock()
 
-						if !reflect.DeepEqual(currURLs, newURLs) {
+						if !reflect.DeepEqual(currURLs, healthyNewURLs) {
 							log.Printf("[Supervisor] [Watch] Detected topology change for model %q!", mName)
 							log.Printf("  Previous URLs: %v", currURLs)
-							log.Printf("  New URLs:      %v", newURLs)
-							if len(newURLs) > 0 {
-								s.performZeroDowntimeReloadForRunner(ctx, runner, newURLs)
+							log.Printf("  New URLs:      %v", healthyNewURLs)
+							if len(healthyNewURLs) > 0 {
+								s.performZeroDowntimeReloadForRunner(ctx, runner, healthyNewURLs)
 							}
 						}
 					}
@@ -635,7 +1017,7 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 					delete(s.runners, mName)
 					s.mu.Unlock()
 
-					if runner != nil && runner.CurrentProc != nil && runner.CurrentProc.cmd.Process != nil {
+					if runner != nil && runner.CurrentProc != nil && runner.CurrentProc.cmd != nil && runner.CurrentProc.cmd.Process != nil {
 						_ = runner.CurrentProc.cmd.Process.Kill()
 					}
 				}
@@ -646,6 +1028,21 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 
 // performZeroDowntimeReloadForRunner executes blue-green rolling reload for a specific model runner.
 func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, runner *ModelRunner, newURLs []string) {
+	runner.mu.Lock()
+	if runner.reloading {
+		runner.mu.Unlock()
+		log.Printf("[Supervisor] Reload already in progress for [%s], skipping duplicate trigger...", runner.ModelName)
+		return
+	}
+	runner.reloading = true
+	runner.mu.Unlock()
+
+	defer func() {
+		runner.mu.Lock()
+		runner.reloading = false
+		runner.mu.Unlock()
+	}()
+
 	nextPort, err := getFreePort()
 	if err != nil {
 		log.Printf("[Supervisor] Error allocating port for [%s] reload: %v", runner.ModelName, err)
@@ -654,16 +1051,16 @@ func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, run
 
 	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 1/4: Launching candidate on internal port %d (New Workers: %d)...",
 		runner.ModelName, nextPort, len(newURLs))
-	newProc, err := s.spawnProcess(ctx, "127.0.0.1", nextPort, newURLs)
+	newProc, err := s.doSpawn(ctx, "127.0.0.1", nextPort, newURLs)
 	if err != nil {
 		log.Printf("[Supervisor] Failed to spawn candidate for [%s]: %v", runner.ModelName, err)
 		return
 	}
 
 	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 2/4: Probing candidate health on port %d...", runner.ModelName, nextPort)
-	if err := s.waitForHealth(ctx, nextPort, s.cfg.HealthCheckTimeout); err != nil {
+	if err := s.checkHealth(ctx, nextPort, s.cfg.HealthCheckTimeout); err != nil {
 		log.Printf("[Supervisor] Candidate health check failed for [%s] on port %d: %v. Aborting reload!", runner.ModelName, nextPort, err)
-		if newProc.cmd.Process != nil {
+		if newProc != nil && newProc.cmd != nil && newProc.cmd.Process != nil {
 			_ = newProc.cmd.Process.Kill()
 		}
 		return
@@ -685,16 +1082,20 @@ func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, run
 	}
 	s.mu.Unlock()
 
-	log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 4/4: Traffic switched! Draining old router (PID %d on port %d) for %v...",
-		runner.ModelName, oldProc.cmd.Process.Pid, oldProc.port, s.cfg.DrainTimeout)
+	if oldProc != nil && oldProc.cmd != nil && oldProc.cmd.Process != nil {
+		log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 4/4: Traffic switched! Draining old router (PID %d on port %d) for %v...",
+			runner.ModelName, oldProc.cmd.Process.Pid, oldProc.port, s.cfg.DrainTimeout)
 
-	go func(proc *runningProcess, drainDuration time.Duration, mName string) {
-		time.Sleep(drainDuration)
-		log.Printf("[Supervisor] Drain period completed for [%s] on port %d (PID %d). Terminating old process.", mName, proc.port, proc.cmd.Process.Pid)
-		if proc.cmd.Process != nil {
-			_ = proc.cmd.Process.Kill()
-		}
-	}(oldProc, s.cfg.DrainTimeout, runner.ModelName)
+		go func(proc *runningProcess, drainDuration time.Duration, mName string) {
+			time.Sleep(drainDuration)
+			log.Printf("[Supervisor] Drain period completed for [%s] on port %d. Terminating old process.", mName, proc.port)
+			if proc.cmd != nil && proc.cmd.Process != nil {
+				_ = proc.cmd.Process.Kill()
+			}
+		}(oldProc, s.cfg.DrainTimeout, runner.ModelName)
+	} else {
+		log.Printf("[Supervisor] [Zero-Downtime Reload] [%s] Step 4/4: Traffic switched (no previous running process to drain).", runner.ModelName)
+	}
 }
 
 // Stop cleanly terminates all processes and servers.
@@ -711,7 +1112,7 @@ func (s *Supervisor) Stop() {
 
 	for mName, runner := range s.runners {
 		runner.mu.Lock()
-		if runner.CurrentProc != nil && runner.CurrentProc.cmd.Process != nil {
+		if runner.CurrentProc != nil && runner.CurrentProc.cmd != nil && runner.CurrentProc.cmd.Process != nil {
 			log.Printf("[Supervisor] Terminating router process for [%s] on port %d (PID %d)...",
 				mName, runner.CurrentProc.port, runner.CurrentProc.cmd.Process.Pid)
 			_ = runner.CurrentProc.cmd.Process.Kill()
