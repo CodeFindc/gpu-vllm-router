@@ -8,11 +8,11 @@ export default function Sidebar({
   onRefreshChange,
   onManualRefresh,
 }) {
-  const mode = (data?.mode || 'proxy').toUpperCase();
+  const modeChinese = data?.mode === 'run' ? '官方守护模式' : '反向代理模式';
 
   const navItems = [
     { id: 'topology', label: '架构拓扑', icon: '🌐' },
-    { id: 'workers', label: 'Worker 负载', icon: '📊' },
+    { id: 'workers', label: '节点负载', icon: '📊' },
     { id: 'playground', label: '推理测试', icon: '💬' },
     { id: 'metrics', label: '监控指标', icon: '📈' },
   ];
@@ -22,9 +22,9 @@ export default function Sidebar({
       <div>
         {/* macOS Traffic Light Window Controls */}
         <div className="window-controls">
-          <span className="traffic-dot dot-red" title="Close" />
-          <span className="traffic-dot dot-yellow" title="Minimize" />
-          <span className="traffic-dot dot-green" title="Zoom" />
+          <span className="traffic-dot dot-red" title="关闭" />
+          <span className="traffic-dot dot-yellow" title="最小化" />
+          <span className="traffic-dot dot-green" title="全屏" />
         </div>
 
         {/* Brand Header */}
@@ -32,7 +32,7 @@ export default function Sidebar({
           <span className="brand-icon">⚡</span>
           <div className="brand-info">
             <span className="brand-name">GPU-vLLM Router</span>
-            <span className="brand-mode-pill">{mode} MODE</span>
+            <span className="brand-mode-pill">{modeChinese}</span>
           </div>
         </div>
 
@@ -59,7 +59,7 @@ export default function Sidebar({
             target="_blank"
             rel="noreferrer"
             className="ext-link"
-            title="Swagger UI Interactive Documentation"
+            title="Swagger 交互式 API 调试文档"
           >
             <span>📘 Swagger 交互文档</span>
             <span className="ext-arrow">↗</span>
@@ -69,9 +69,9 @@ export default function Sidebar({
             target="_blank"
             rel="noreferrer"
             className="ext-link"
-            title="ReDoc API Specification"
+            title="ReDoc 技术参考规范"
           >
-            <span>📑 ReDoc 规范接口</span>
+            <span>📑 ReDoc 技术规范</span>
             <span className="ext-arrow">↗</span>
           </a>
           <a
@@ -79,9 +79,9 @@ export default function Sidebar({
             target="_blank"
             rel="noreferrer"
             className="ext-link"
-            title="Health Check Endpoint"
+            title="健康检查状态探针"
           >
-            <span>🩺 健康状态探针</span>
+            <span>🩺 服务健康探针</span>
             <span className="ext-arrow">↗</span>
           </a>
           <a
@@ -89,9 +89,9 @@ export default function Sidebar({
             target="_blank"
             rel="noreferrer"
             className="ext-link"
-            title="Raw OpenAPI 3.0 Schema"
+            title="OpenAPI 3.0 原始规范定义"
           >
-            <span>📋 OpenAPI Schema</span>
+            <span>📋 OpenAPI 结构定义</span>
             <span className="ext-arrow">↗</span>
           </a>
         </div>
@@ -100,7 +100,7 @@ export default function Sidebar({
       {/* Footer Refresh & System Info */}
       <div className="sidebar-footer">
         <div className="footer-row">
-          <span>刷新频率</span>
+          <span>自动刷新</span>
           <select
             className="control-select"
             value={refreshMs}
@@ -118,7 +118,7 @@ export default function Sidebar({
           <span>立即手动同步</span>
         </button>
         <div className="footer-row" style={{ fontSize: '10px', color: 'var(--text-dim)', justifyContent: 'center' }}>
-          <span>v2.1 · Consistent Hash</span>
+          <span>版本 v2.1 · 一致性哈希调度</span>
         </div>
       </div>
     </aside>

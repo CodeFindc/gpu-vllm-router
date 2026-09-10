@@ -4,7 +4,7 @@ export default function PlaygroundView({ models, onSent }) {
   const [model, setModel] = useState('');
   const [sessionID, setSessionID] = useState('demo-session-client-01');
   const [prompt, setPrompt] = useState(
-    '你好！请简述 gpu-vllm-router 如何通过一致性哈希 (Consistent Hash) 与会话粘性保障 KV Cache 前缀缓存命中率？'
+    '你好！请简述 gpu-vllm-router 如何通过一致性哈希算法与会话粘性保障 KV Cache 前缀缓存的高命中率？'
   );
   const [output, setOutput] = useState('点击左侧 “发送推理请求” 开始测试...');
   const [status, setStatus] = useState('');
@@ -24,8 +24,8 @@ export default function PlaygroundView({ models, onSent }) {
     }
 
     setLoading(true);
-    setStatus('正在调度后端 Worker 执行推理...');
-    setOutput('正在等待推理模型返回...');
+    setStatus('正在调度后端节点执行推理...');
+    setOutput('正在等待模型返回响应...');
     const startTime = performance.now();
 
     try {
@@ -47,10 +47,10 @@ export default function PlaygroundView({ models, onSent }) {
       if (!resp.ok) {
         const errText = await resp.text();
         setStatus(`❌ 请求失败 (HTTP ${resp.status})`);
-        setOutput(`HTTP ${resp.status} Error (${elapsed}ms):\n${errText}`);
+        setOutput(`HTTP ${resp.status} 错误 (${elapsed}毫秒):\n${errText}`);
       } else {
         const res = await resp.json();
-        setStatus(`🟢 推理成功 (${elapsed}ms)`);
+        setStatus(`🟢 推理成功 (${elapsed}毫秒)`);
         const content =
           res.choices && res.choices[0] && res.choices[0].message
             ? res.choices[0].message.content
@@ -60,7 +60,7 @@ export default function PlaygroundView({ models, onSent }) {
       if (onSent) onSent();
     } catch (err) {
       setStatus('❌ 网络通信异常');
-      setOutput(`Request error: ${err.message}`);
+      setOutput(`请求异常: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -71,7 +71,7 @@ export default function PlaygroundView({ models, onSent }) {
       <div className="panel-header">
         <div className="panel-title">
           <span>💬</span>
-          <span>在线快速推理测试沙箱 (Interactive Inference Playground)</span>
+          <span>在线推理测试沙箱</span>
         </div>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
           {status && (
@@ -94,7 +94,7 @@ export default function PlaygroundView({ models, onSent }) {
         {/* Left: Input Form */}
         <div>
           <div className="play-form-group">
-            <label className="play-label">目标模型 (Target Model):</label>
+            <label className="play-label">选择目标模型:</label>
             <select
               className="play-select"
               value={model}
@@ -105,7 +105,7 @@ export default function PlaygroundView({ models, onSent }) {
               ) : (
                 models.map((m) => (
                   <option key={m.model_name} value={m.model_name}>
-                    {m.model_name} ({m.healthy_count}/{m.worker_count} 在线 Worker)
+                    {m.model_name} ({m.healthy_count}/{m.worker_count} 就绪节点)
                   </option>
                 ))
               )}
@@ -113,7 +113,7 @@ export default function PlaygroundView({ models, onSent }) {
           </div>
 
           <div className="play-form-group">
-            <label className="play-label">会话粘性标识 (X-Session-ID / 前缀缓存亲和):</label>
+            <label className="play-label">会话标识 (X-Session-ID / 保持前缀缓存亲和):</label>
             <input
               type="text"
               className="play-input"
@@ -124,7 +124,7 @@ export default function PlaygroundView({ models, onSent }) {
           </div>
 
           <div className="play-form-group">
-            <label className="play-label">提示词内容 (User Prompt):</label>
+            <label className="play-label">输入测试提示词:</label>
             <textarea
               className="play-textarea"
               value={prompt}
@@ -146,10 +146,10 @@ export default function PlaygroundView({ models, onSent }) {
         {/* Right: Response Viewer */}
         <div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-            <span className="play-label">模型响应输出 (Response Body / Markdown / JSON):</span>
+            <span className="play-label">模型响应结果内容:</span>
             {latency !== null && (
               <span style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                耗时: {latency} ms
+                耗时: {latency} 毫秒
               </span>
             )}
           </div>

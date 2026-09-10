@@ -10,17 +10,17 @@ export default function MetricsView({ data, onCopy }) {
         <div className="panel-header">
           <div className="panel-title">
             <span>📈</span>
-            <span>Prometheus 监控度量与原生接口集成 (Telemetry & Admin Endpoints)</span>
+            <span>Prometheus 监控度量与原生接口集成</span>
           </div>
-          <span className="badge-pill pill-blue">OpenMetrics 兼容</span>
+          <span className="badge-pill pill-blue">OpenMetrics 规范兼容</span>
         </div>
         <div style={{ padding: '20px 24px', display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
           <div style={{ flex: 1, minWidth: '240px', background: 'rgba(255,255,255,0.8)', border: '1px solid var(--glass-border-subtle)', borderRadius: '12px', padding: '16px' }}>
             <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '6px' }}>
-              📊 Prometheus Metrics
+              📊 Prometheus 监控指标
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
-              暴露 <code>vllm_router_requests_total</code>、<code>vllm_router_active_connections</code> 等度量指标。
+              暴露请求总数、活跃并发连接数等实时性能监控度量。
             </div>
             <a
               href="/metrics"
@@ -35,10 +35,10 @@ export default function MetricsView({ data, onCopy }) {
 
           <div style={{ flex: 1, minWidth: '240px', background: 'rgba(255,255,255,0.8)', border: '1px solid var(--glass-border-subtle)', borderRadius: '12px', padding: '16px' }}>
             <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '6px' }}>
-              ⚡ Cluster Admin Stats
+              ⚡ 集群管理运行状态
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
-              获取网关级并发连接与模型就绪状态汇总。
+              获取网关级并发连接与模型就绪状态汇总 JSON 数据。
             </div>
             <a
               href="/admin/stats"
@@ -53,10 +53,10 @@ export default function MetricsView({ data, onCopy }) {
 
           <div style={{ flex: 1, minWidth: '240px', background: 'rgba(255,255,255,0.8)', border: '1px solid var(--glass-border-subtle)', borderRadius: '12px', padding: '16px' }}>
             <div style={{ fontSize: '13px', fontWeight: 700, marginBottom: '6px' }}>
-              🩺 Liveness & Readiness
+              🩺 服务存活与就绪探针
             </div>
             <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
-              K8s / 容器探针探测端点，返回 200 OK。
+              用于容器编排平台健康检查探测端点，返回 200 OK。
             </div>
             <a
               href="/healthz"
@@ -76,13 +76,13 @@ export default function MetricsView({ data, onCopy }) {
         <div className="panel-header">
           <div className="panel-title">
             <span>📋</span>
-            <span>集群动态拓扑原始快照 (Live Topology JSON Snapshot)</span>
+            <span>集群动态拓扑原始快照 (JSON)</span>
           </div>
           <button
             className="btn-micro"
             onClick={() => onCopy(jsonString)}
           >
-            📋 复制 JSON 快照
+            📋 复制数据快照
           </button>
         </div>
         <div style={{ padding: '16px 24px' }}>

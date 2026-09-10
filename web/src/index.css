@@ -251,10 +251,13 @@ body {
 
 /* Right Main Content Area */
 .main-workspace {
-  flex: 1;
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   height: 100vh;
+  max-height: 100vh;
   overflow: hidden;
   position: relative;
 }
@@ -354,12 +357,30 @@ body {
 
 /* Scrollable Main Area */
 .content-scroll {
-  flex: 1;
+  flex: 1 1 0%;
+  min-height: 0;
   overflow-y: auto;
-  padding: 24px 28px 40px 28px;
+  overflow-x: hidden;
+  padding: 20px 24px 40px 24px;
   display: flex;
   flex-direction: column;
   gap: 20px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.4) transparent;
+}
+.content-scroll::-webkit-scrollbar {
+  width: 7px;
+}
+.content-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.content-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 9999px;
+}
+.content-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.65);
 }
 
 /* KPI Summary Cards Grid */
@@ -444,43 +465,59 @@ body {
 
 /* Topology Flow Canvas - Light Frosted Aesthetic */
 .topology-canvas {
-  padding: 22px 24px;
+  padding: 16px 20px;
   background: radial-gradient(circle at 20% 20%, rgba(255, 255, 255, 0.95) 0%, rgba(241, 245, 249, 0.6) 100%);
   overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
 }
+.topology-canvas::-webkit-scrollbar {
+  height: 6px;
+}
+.topology-canvas::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 9999px;
+}
+.topology-canvas::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.4);
+  border-radius: 9999px;
+}
+
 .topo-flow {
   display: flex;
   align-items: flex-start;
   justify-content: flex-start;
-  gap: 14px;
-  min-width: 960px;
+  gap: 12px;
+  min-width: 820px;
   width: 100%;
 }
 .topo-stage {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
-/* Balanced Proportional Widths for Stages */
+/* Balanced Proportional Widths for Stages - Compact and Responsive */
 .topo-stage-clients {
-  width: 200px;
-  min-width: 200px;
+  width: 175px;
+  min-width: 160px;
   flex-shrink: 0;
 }
 .topo-stage-router {
-  width: 230px;
-  min-width: 230px;
+  width: 210px;
+  min-width: 190px;
   flex-shrink: 0;
 }
 .topo-stage-models {
-  width: 260px;
-  min-width: 260px;
+  width: 230px;
+  min-width: 200px;
   flex-shrink: 0;
 }
 .topo-stage-workers {
-  flex: 1;
-  min-width: 320px;
+  flex: 1 1 260px;
+  min-width: 240px;
 }
 
 .topo-stage-header {
@@ -495,8 +532,7 @@ body {
   font-size: 11px;
   font-weight: 700;
   color: var(--apple-blue);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.03em;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -504,7 +540,7 @@ body {
 .topo-stage-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
 }
 
@@ -514,12 +550,12 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding-top: 46px;
+  padding-top: 40px;
   flex-shrink: 0;
-  width: 20px;
+  width: 16px;
 }
 .topo-arrow {
-  font-size: 15px;
+  font-size: 14px;
   color: var(--text-dim);
   line-height: 1;
   animation: pulseArrow 2s infinite ease-in-out;
@@ -527,6 +563,40 @@ body {
 @keyframes pulseArrow {
   0%, 100% { opacity: 0.35; transform: translateX(0); }
   50% { opacity: 1; color: var(--apple-blue); transform: translateX(3px); }
+}
+
+/* Grouped Architecture Tree View (Alternative Responsive Mode) */
+.topo-grouped-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+.topo-group-card {
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid var(--glass-border-subtle);
+  border-radius: 14px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: all 0.2s ease;
+}
+.topo-group-card:hover {
+  border-color: rgba(0, 113, 227, 0.3);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.03);
+}
+.topo-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.topo-group-workers-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
 }
 
 /* Topology Node Cards */

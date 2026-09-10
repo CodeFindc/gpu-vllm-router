@@ -2,20 +2,20 @@ import React from 'react';
 
 const TAB_TITLES = {
   topology: {
-    title: '🌐 多模型路由架构拓扑流',
-    sub: '动态端点调度、前缀缓存亲和性与 X-Session-ID 粘性分析',
+    title: '多模型路由架构拓扑',
+    sub: '动态端点调度、前缀缓存亲和性与会话粘性实时流向分析',
   },
   workers: {
-    title: '📊 各模型推理集群与 Worker 节点负载明细',
-    sub: '实时并发连接深度跟踪、断路器隔离状态与在线微调运维',
+    title: '模型集群与工作节点负载明细',
+    sub: '实时活跃并发连接跟踪、断路器隔离状态与在线微调运维',
   },
   playground: {
-    title: '💬 在线快速推理测试沙箱',
+    title: '在线推理测试沙箱',
     sub: 'OpenAI 协议兼容测试、会话粘性验证与端到端延迟统计',
   },
   metrics: {
-    title: '📈 系统指标与集群拓扑',
-    sub: 'Prometheus 监控度量集成与底层集群原始 JSON 架构视图',
+    title: '系统度量指标与拓扑快照',
+    sub: 'Prometheus 监控度量集成与底层集群原始数据架构快照',
   },
 };
 
@@ -30,13 +30,13 @@ export default function HeaderBar({
   const total = data?.total_workers || 0;
   const healthy = data?.healthy_workers || 0;
 
-  let healthPill = { class: 'pill-green', text: '🟢 集群运行健康' };
+  let healthPill = { class: 'pill-green', text: '🟢 集群运行良好' };
   if (total === 0) {
-    healthPill = { class: 'pill-amber', text: '⚪ 节点探测等待中' };
+    healthPill = { class: 'pill-amber', text: '⚪ 等待节点探测' };
   } else if (healthy === 0) {
-    healthPill = { class: 'pill-red', text: '🔴 集群节点中断' };
+    healthPill = { class: 'pill-red', text: '🔴 全集群节点中断' };
   } else if (healthy < total) {
-    healthPill = { class: 'pill-amber', text: `🟡 ${total - healthy} 节点熔断隔离` };
+    healthPill = { class: 'pill-amber', text: `🟡 ${total - healthy} 个节点熔断隔离` };
   }
 
   return (
@@ -53,7 +53,7 @@ export default function HeaderBar({
           <input
             type="text"
             className="search-input"
-            placeholder="搜索模型或 Worker 端点..."
+            placeholder="搜索模型名称或节点端点..."
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
           />
@@ -67,7 +67,7 @@ export default function HeaderBar({
         {/* Last Updated */}
         {lastUpdated && (
           <span style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
-            {lastUpdated}
+            最近同步: {lastUpdated}
           </span>
         )}
       </div>

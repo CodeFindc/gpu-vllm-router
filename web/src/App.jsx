@@ -52,13 +52,13 @@ export default function App() {
       });
       const res = await resp.json();
       if (res.success) {
-        showToast(`🟢 节点探针嗅探成功: ${url}`);
+        showToast(`🟢 节点探针检测成功: ${url}`);
       } else {
-        showToast(`🔴 节点探针嗅探失败: ${res.message || '超时或异常'}`, true);
+        showToast(`🔴 节点探针检测失败: ${res.message || '超时或异常'}`, true);
       }
       fetchTopology();
     } catch (err) {
-      showToast(`❌ 嗅探请求异常: ${err.message}`, true);
+      showToast(`❌ 探针请求异常: ${err.message}`, true);
     }
   };
 
@@ -70,7 +70,7 @@ export default function App() {
         body: JSON.stringify({ url }),
       });
       await resp.json();
-      showToast(`🔄 已重置断路器为 CLOSED: ${url}`);
+      showToast(`🔄 已重置断路器为正常状态: ${url}`);
       fetchTopology();
     } catch (err) {
       showToast(`❌ 重置请求异常: ${err.message}`, true);
