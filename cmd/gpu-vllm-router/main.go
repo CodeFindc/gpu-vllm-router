@@ -75,8 +75,10 @@ func main() {
 		}
 	}
 
+	var fileCfg *config.FileConfig
 	if actualConfigPath != "" {
-		fileCfg, err := config.LoadConfig(actualConfigPath)
+		var err error
+		fileCfg, err = config.LoadConfig(actualConfigPath)
 		if err != nil {
 			log.Fatalf("加载配置文件失败: %v", err)
 		}
@@ -290,12 +292,29 @@ func main() {
 
 	case "proxy":
 		log.Printf("正在启动内置 Go 语言高性能 OpenAI 兼容反向代理网关...")
+		cbCfg := proxy.DefaultCircuitBreakerConfig()
+		if fileCfg != nil {
+			if fileCfg.CircuitBreaker.MaxFailures > 0 {
+				cbCfg.MaxFailures = fileCfg.CircuitBreaker.MaxFailures
+			}
+			if fileCfg.CircuitBreaker.Cooldown > 0 {
+				cbCfg.Cooldown = fileCfg.CircuitBreaker.Cooldown
+			}
+			if fileCfg.CircuitBreaker.MaxRetries > 0 {
+				cbCfg.MaxRetries = fileCfg.CircuitBreaker.MaxRetries
+			}
+			if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
+				cbCfg.HealthCheckInterval = fileCfg.CircuitBreaker.HealthCheckInterval
+			}
+		}
+
 		proxyCfg := proxy.ServerConfig{
-			Host:          *host,
-			Port:          *port,
-			Policy:        selectedPolicy,
-			ModelName:     *modelName,
-			WatchInterval: *watchInterval,
+			Host:           *host,
+			Port:           *port,
+			Policy:         selectedPolicy,
+			ModelName:      *modelName,
+			WatchInterval:  *watchInterval,
+			CircuitBreaker: cbCfg,
 		}
 		srv := proxy.NewServer(proxyCfg, client)
 

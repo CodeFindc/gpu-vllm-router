@@ -35,11 +35,21 @@ type RouterConfig struct {
 	DrainTimeout     time.Duration `yaml:"drain_timeout"`
 }
 
+// CircuitBreakerConfig holds settings for circuit breaker and failover.
+type CircuitBreakerConfig struct {
+	Enabled             *bool         `yaml:"enabled"`
+	MaxFailures         int           `yaml:"max_failures"`
+	Cooldown            time.Duration `yaml:"cooldown"`
+	MaxRetries          int           `yaml:"max_retries"`
+	HealthCheckInterval time.Duration `yaml:"health_check_interval"`
+}
+
 // FileConfig represents the full structure of config.yaml.
 type FileConfig struct {
-	GPUStack GPUStackConfig `yaml:"gpustack"`
-	Target   TargetConfig   `yaml:"target"`
-	Router   RouterConfig   `yaml:"router"`
+	GPUStack       GPUStackConfig       `yaml:"gpustack"`
+	Target         TargetConfig         `yaml:"target"`
+	Router         RouterConfig         `yaml:"router"`
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
 }
 
 // LoadConfig reads and parses a YAML configuration file.

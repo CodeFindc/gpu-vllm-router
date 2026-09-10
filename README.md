@@ -25,12 +25,13 @@
   - [4. 模式三：官方路由器守护与零停机重载 (`-mode run`)](#4-模式三官方路由器守护与零停机重载--mode-run)
 - [五、全集群多模型动态路由机制](#五全集群多模型动态路由机制)
 - [六、零停机热重载（Zero-Downtime）原理解析](#六零停机热重载zero-downtime原理解析)
-- [七、命令行参数与环境变量全集](#七命令行参数与环境变量全集)
-- [八、配置文件使用 (`config.yaml`)](#八配置文件使用-configyaml)
-- [九、管理与监控接口](#九管理与监控接口)
-- [十、生产部署与运维建议](#十生产部署与运维建议)
-- [十一、编译与测试](#十一编译与测试)
-- [十二、Docker 与 Docker-Compose 容器化部署](#十二docker-与-docker-compose-容器化部署)
+- [七、熔断器（Circuit Breaker）与透明故障转移（Failover Retry）](#七熔断器circuit-breaker与透明故障转移failover-retry)
+- [八、命令行参数与环境变量全集](#八命令行参数与环境变量全集)
+- [九、配置文件使用 (`config.yaml`)](#九配置文件使用-configyaml)
+- [十、管理与监控接口](#十管理与监控接口)
+- [十一、生产部署与运维建议](#十一生产部署与运维建议)
+- [十二、编译与测试](#十二编译与测试)
+- [十三、Docker 与 Docker-Compose 容器化部署](#十三docker-与-docker-compose-容器化部署)
 
 ---
 
@@ -382,7 +383,32 @@ flowchart TD
 
 ---
 
-## 七、命令行参数与环境变量全集
+## 七、熔断器（Circuit Breaker）与透明故障转移（Failover Retry）
+
+在大模型推理集群中，部分 Worker 节点可能会因显存 OOM、硬件故障或管理员维护操作而发生**进程崩溃或重启**。为了解决传统轮询在 0~10 秒检测真空期内导致客户端收到 `502 Bad Gateway` 的问题，`gpu-vllm-router` 内置了**断路器与透明故障转移状态机**：
+
+### 1. 三态断路器状态机 (Circuit Breaker State Machine)
+
+每个后端节点（Worker Endpoint）均绑定独立的断路器状态跟踪：
+
+- 🟢 **CLOSED (健康闭合)**：正常接收并均衡处理请求，记录成功与失败次数；
+- 🔴 **OPEN (熔断断开)**：当某个节点连续发生 $N$ 次网络连接失败（如 Connection Refused、Dial Timeout）或 5xx 错误时，系统**毫秒级**将该节点标记为 OPEN，并立即将其从可用路由环/池中剔除，无需等待 10s 的 GPUStack API 轮询！
+- 🟡 **HALF_OPEN (半开试探)**：进入冷却时间（默认 10s）后，断路器进入半开状态，允许后台主动健康探针（GET /health）或单次测试流量试探后端；一旦验证通过，自动恢复为 CLOSED。
+
+### 2. 透明故障转移与无感重试 (Zero-Downtime Failover Retry)
+
+- 当请求发往某节点并在握手/拨号阶段遭遇网络异常时，反向代理**不会直接返回 502 错误**；
+- 系统记录该节点失败一次，并在**完全未向客户端写入数据的前提下**，毫秒级从同模型的其余健康可用节点中重新选取目标进行重试（默认最大重试 2 次）；
+- **业务收益**：集群中即便有实例突发宕机或正在重启，调用方依然能获得 100% 的请求成功率与 HTTP 200 返回，业务端完全无感知！
+
+### 3. 主动后台自愈探针 (Proactive Health Probing)
+
+- 处于 OPEN 状态的故障节点，系统会在后台每隔数秒（默认 3s）主动探测其 `/health` 端点；
+- 一旦节点重启完毕并开始响应，系统立即先于 GPUStack 控制面完成状态自愈（恢复为 CLOSED），毫秒级重新引入流量。
+
+---
+
+## 八、命令行参数与环境变量全集
 
 | 参数名称 | 环境变量对应 | 默认值 | 详细说明 |
 | :--- | :--- | :--- | :--- |
@@ -405,7 +431,7 @@ flowchart TD
 
 ---
 
-## 八、配置文件使用 (`config.yaml`)
+## 九、配置文件使用 (`config.yaml`)
 
 除了命令行参数外，建议配合 `config.yaml` 统一管理：
 
@@ -435,11 +461,19 @@ router:
   data_parallel_size: 1
   zero_downtime: true
   drain_timeout: 60s
+
+# 熔断器 (Circuit Breaker) 与故障转移配置 (Proxy 模式)
+circuit_breaker:
+  enabled: true               # 是否开启断路器与透明重试
+  max_failures: 3             # 连续失败达到此阈值触发熔断隔离 (State: OPEN)
+  cooldown: 10s               # 熔断隔离冷却时间 (State: HALF_OPEN)
+  max_retries: 2              # 单个请求遭遇故障/重启节点时的最大透明重试次数
+  health_check_interval: 3s   # 处于隔离状态节点的后台自愈嗅探探测周期
 ```
 
 ---
 
-## 九、管理与监控接口
+## 十、管理与监控接口
 
 当程序以 `-mode proxy` 或 `-mode run` 运行时，对外提供统一的管理端点：
 
@@ -453,7 +487,7 @@ router:
 
 ---
 
-## 十、生产部署与运维建议
+## 十一、生产部署与运维建议
 
 ### 1. Linux Systemd 守护进程托管示例
 在生产 Linux 环境中，可编写 `/etc/systemd/system/gpu-vllm-router.service`：
@@ -487,7 +521,7 @@ WantedBy=multi-user.target
 
 ---
 
-## 十一、编译与测试
+## 十二、编译与测试
 
 本项目采用 Go 官方标准库编写，零第三方冗余依赖，支持跨平台一键编译：
 
@@ -504,7 +538,7 @@ $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o gpu-vllm-router-linux ./cmd/
 
 ---
 
-## 十二、Docker 与 Docker-Compose 容器化部署
+## 十三、Docker 与 Docker-Compose 容器化部署
 
 项目提供生产级多阶段构建 `Dockerfile` 与 `Dockerfile.cn`（内置最新官方 `vllm-router` Rust 二进制与 Go 调度服务）和支持动态挂载配置文件的 `docker-compose.yml` / `docker-compose.cn.yml`。
 

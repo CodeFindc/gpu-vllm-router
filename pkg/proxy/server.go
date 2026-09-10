@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gpu-vllm-router/pkg/gpustack"
@@ -22,11 +23,12 @@ import (
 
 // ServerConfig configures the native Go reverse proxy server.
 type ServerConfig struct {
-	Host          string
-	Port          int
-	Policy        router.Policy
-	ModelName     string // If empty, operates in full-cluster multi-model mode
-	WatchInterval time.Duration
+	Host           string
+	Port           int
+	Policy         router.Policy
+	ModelName      string // If empty, operates in full-cluster multi-model mode
+	WatchInterval  time.Duration
+	CircuitBreaker CircuitBreakerConfig
 }
 
 // ModelPool manages load balancing and active targets for a specific model.
@@ -34,6 +36,90 @@ type ModelPool struct {
 	ModelName string
 	Balancer  Balancer
 	Targets   []*BackendTarget
+}
+
+// routeState maintains in-flight routing state across retries and failovers.
+type routeState struct {
+	target   *BackendTarget
+	balancer Balancer
+	pool     *ModelPool
+}
+
+// retryTransport wraps http.RoundTripper with transparent failover and circuit breaker tracking.
+type retryTransport struct {
+	server *Server
+	base   http.RoundTripper
+}
+
+func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	state, _ := ctx.Value("route_state").(*routeState)
+	if state == nil || state.target == nil || state.pool == nil || state.balancer == nil {
+		return t.base.RoundTrip(req)
+	}
+
+	maxRetries := t.server.cfg.CircuitBreaker.MaxRetries
+	excluded := make(map[string]bool)
+
+	var lastResp *http.Response
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Reset body reader for this attempt if GetBody is available
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err == nil {
+				req.Body = body
+			}
+		}
+
+		resp, err := t.base.RoundTrip(req)
+		if err == nil && resp.StatusCode < 500 {
+			if state.target.CircuitBreaker != nil {
+				state.target.CircuitBreaker.RecordSuccess()
+			}
+			resp.Header.Set("X-Routed-Target", state.target.URLString)
+			return resp, nil
+		}
+
+		lastResp = resp
+		lastErr = err
+		if state.target.CircuitBreaker != nil {
+			state.target.CircuitBreaker.RecordFailure(err)
+		}
+
+		if attempt >= maxRetries {
+			break
+		}
+
+		// Exclude current failing target
+		excluded[state.target.URLString] = true
+
+		// Try to select alternative healthy target for this model
+		nextTarget, selectErr := state.pool.Balancer.SelectTargetExcluding(req, excluded)
+		if selectErr != nil {
+			log.Printf("[Proxy:Failover] No alternative healthy backends available for model %s: %v", state.pool.ModelName, selectErr)
+			break
+		}
+
+		// Update active connections
+		state.balancer.RecordRequestEnd(state.target)
+		state.balancer.RecordRequestStart(nextTarget)
+
+		log.Printf("[Proxy:Failover] ⚡ Target %s failed (%v). Retrying on alternative target %s (attempt %d/%d)...",
+			state.target.URLString, err, nextTarget.URLString, attempt+1, maxRetries)
+
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+
+		state.target = nextTarget
+		req.URL.Scheme = state.target.URL.Scheme
+		req.URL.Host = state.target.URL.Host
+		req.Host = state.target.URL.Host
+	}
+
+	return lastResp, lastErr
 }
 
 // Server is the built-in HTTP reverse proxy server with multi-model dynamic load balancing.
@@ -61,6 +147,9 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 	if cfg.WatchInterval <= 0 {
 		cfg.WatchInterval = 10 * time.Second
 	}
+	if cfg.CircuitBreaker.MaxFailures <= 0 {
+		cfg.CircuitBreaker = DefaultCircuitBreakerConfig()
+	}
 
 	s := &Server{
 		cfg:        cfg,
@@ -69,12 +158,13 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 		stopCh:     make(chan struct{}),
 	}
 
-	// Custom ReverseProxy
+	// Custom ReverseProxy with RetryTransport
 	proxy := &httputil.ReverseProxy{
 		Director:       s.director,
 		ModifyResponse: s.modifyResponse,
 		ErrorHandler:   s.errorHandler,
 		FlushInterval:  10 * time.Millisecond, // Instant flush for LLM streaming SSE
+		Transport:      &retryTransport{server: s, base: http.DefaultTransport},
 	}
 	s.reverseProxy = proxy
 
@@ -92,8 +182,11 @@ func extractModelFromRequest(req *http.Request) (string, []byte) {
 	if req.Body != nil && (req.Method == http.MethodPost || req.Method == http.MethodPut) {
 		bodyBytes, err := io.ReadAll(req.Body)
 		if err == nil {
-			// Restore request body for downstream handlers
+			// Restore request body and set GetBody for transparent retries
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
 
 			var peek struct {
 				Model string `json:"model"`
@@ -184,9 +277,13 @@ func (s *Server) director(req *http.Request) {
 	// Record start of request for active connection tracking
 	pool.Balancer.RecordRequestStart(target)
 
-	// Save selected target and balancer in context
-	ctx := context.WithValue(req.Context(), "selected_target", target)
-	ctx = context.WithValue(ctx, "selected_balancer", pool.Balancer)
+	// Save routeState in context for retryTransport, modifyResponse, and errorHandler
+	state := &routeState{
+		target:   target,
+		balancer: pool.Balancer,
+		pool:     pool,
+	}
+	ctx := context.WithValue(req.Context(), "route_state", state)
 	ctx = context.WithValue(ctx, "routed_model", pool.ModelName)
 	*req = *req.WithContext(ctx)
 
@@ -201,10 +298,9 @@ func (s *Server) director(req *http.Request) {
 
 func (s *Server) modifyResponse(resp *http.Response) error {
 	ctx := resp.Request.Context()
-	target, _ := ctx.Value("selected_target").(*BackendTarget)
-	balancer, _ := ctx.Value("selected_balancer").(Balancer)
-	if target != nil && balancer != nil {
-		balancer.RecordRequestEnd(target)
+	state, _ := ctx.Value("route_state").(*routeState)
+	if state != nil && state.target != nil && state.balancer != nil {
+		state.balancer.RecordRequestEnd(state.target)
 	}
 
 	// Add router indicators
@@ -217,10 +313,9 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 
 func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err error) {
 	ctx := req.Context()
-	target, _ := ctx.Value("selected_target").(*BackendTarget)
-	balancer, _ := ctx.Value("selected_balancer").(Balancer)
-	if target != nil && balancer != nil {
-		balancer.RecordRequestEnd(target)
+	state, _ := ctx.Value("route_state").(*routeState)
+	if state != nil && state.target != nil && state.balancer != nil {
+		state.balancer.RecordRequestEnd(state.target)
 	}
 
 	// If route_error occurred (model not found)
@@ -281,6 +376,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// Setup HTTP handler multiplexer
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/stats", s.handleStats)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.Handle("/", s.reverseProxy)
@@ -294,7 +390,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start background watch loop
 	go s.watchLoop(ctx)
 
-	log.Printf("[Proxy] Native Multi-Model Load Balancer running on http://%s (Policy: %s)", addr, s.cfg.Policy)
+	// Start background circuit breaker active health probe loop
+	go s.probeLoop(ctx)
+
+	log.Printf("[Proxy] Native Multi-Model Load Balancer running on http://%s (Policy: %s, MaxRetries: %d)",
+		addr, s.cfg.Policy, s.cfg.CircuitBreaker.MaxRetries)
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("proxy server failed: %w", err)
@@ -312,6 +412,15 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (s *Server) findExistingTarget(urlStr string) *BackendTarget {
+	for _, t := range s.allTargets {
+		if t.URLString == urlStr {
+			return t
+		}
+	}
+	return nil
+}
+
 func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpustack.WorkerEndpoint) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,10 +433,20 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 		if err != nil {
 			continue
 		}
+
+		existing := s.findExistingTarget(ep.URL)
+		var cb *CircuitBreaker
+		if existing != nil && existing.CircuitBreaker != nil {
+			cb = existing.CircuitBreaker
+		} else {
+			cb = NewCircuitBreaker(ep.URL, s.cfg.CircuitBreaker)
+		}
+
 		targets = append(targets, &BackendTarget{
-			URL:       u,
-			URLString: ep.URL,
-			Healthy:   true,
+			URL:            u,
+			URLString:      ep.URL,
+			Healthy:        true,
+			CircuitBreaker: cb,
 		})
 		urls = append(urls, ep.URL)
 		log.Printf("  -> Model: %-25s Backend: %s (Worker: %s)", ep.ModelName, ep.URL, ep.WorkerName)
@@ -361,10 +480,20 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 			if err != nil {
 				continue
 			}
+
+			existing := s.findExistingTarget(ep.URL)
+			var cb *CircuitBreaker
+			if existing != nil && existing.CircuitBreaker != nil {
+				cb = existing.CircuitBreaker
+			} else {
+				cb = NewCircuitBreaker(ep.URL, s.cfg.CircuitBreaker)
+			}
+
 			t := &BackendTarget{
-				URL:       u,
-				URLString: ep.URL,
-				Healthy:   true,
+				URL:            u,
+				URLString:      ep.URL,
+				Healthy:        true,
+				CircuitBreaker: cb,
 			}
 			targets = append(targets, t)
 			allTargets = append(allTargets, t)
@@ -390,6 +519,43 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 	s.allTargets = allTargets
 	s.activeURLs = allURLs
 	s.modelsList = modelsList
+}
+
+func (s *Server) probeLoop(ctx context.Context) {
+	interval := s.cfg.CircuitBreaker.HealthCheckInterval
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.mu.RLock()
+			targets := make([]*BackendTarget, len(s.allTargets))
+			copy(targets, s.allTargets)
+			s.mu.RUnlock()
+
+			for _, t := range targets {
+				if t.CircuitBreaker == nil {
+					continue
+				}
+				state, _, _ := t.CircuitBreaker.GetStatus()
+				if state == StateOpen || state == StateHalfOpen {
+					go func(target *BackendTarget) {
+						if target.CircuitBreaker.Probe() {
+							log.Printf("[Proxy:Probe] 🟢 Target %s self-healing probe succeeded! Restored to CLOSED", target.URLString)
+						}
+					}(t)
+				}
+			}
+		}
+	}
 }
 
 func (s *Server) watchLoop(ctx context.Context) {
@@ -517,9 +683,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	type targetStat struct {
-		URL         string `json:"url"`
-		ActiveConns int64  `json:"active_conns"`
-		Healthy     bool   `json:"healthy"`
+		URL                 string       `json:"url"`
+		ActiveConns         int64        `json:"active_conns"`
+		Healthy             bool         `json:"healthy"`
+		CircuitState        CircuitState `json:"circuit_state"`
+		ConsecutiveFailures int          `json:"consecutive_failures"`
 	}
 
 	type modelStat struct {
@@ -532,10 +700,19 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	for mName, pool := range pools {
 		var bStats []targetStat
 		for _, t := range pool.Targets {
+			state := StateClosed
+			fails := 0
+			healthy := true
+			if t.CircuitBreaker != nil {
+				state, fails, _ = t.CircuitBreaker.GetStatus()
+				healthy = t.CircuitBreaker.CanExecute()
+			}
 			bStats = append(bStats, targetStat{
-				URL:         t.URLString,
-				ActiveConns: t.ActiveConns,
-				Healthy:     t.Healthy,
+				URL:                 t.URLString,
+				ActiveConns:         atomic.LoadInt64(&t.ActiveConns),
+				Healthy:             healthy,
+				CircuitState:        state,
+				ConsecutiveFailures: fails,
 			})
 		}
 		modelsStats[mName] = modelStat{
@@ -547,11 +724,71 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"mode":            "multi_model_auto_sync",
-		"policy":          s.cfg.Policy,
-		"model_count":     len(pools),
-		"total_backends":  totalTargets,
-		"models":          modelsStats,
-		"server_time_utc": time.Now().UTC().Format(time.RFC3339),
+		"mode":                   "multi_model_auto_sync",
+		"policy":                 s.cfg.Policy,
+		"model_count":            len(pools),
+		"total_backends":         totalTargets,
+		"models":                 modelsStats,
+		"circuit_breaker_config": s.cfg.CircuitBreaker,
+		"server_time_utc":        time.Now().UTC().Format(time.RFC3339),
 	})
 }
+
+// handleMetrics exposes Prometheus-formatted metrics for Grafana monitoring.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	pools := s.modelPools
+	totalTargets := len(s.allTargets)
+	s.mu.RUnlock()
+
+	var buf bytes.Buffer
+
+	buf.WriteString("# HELP gpu_router_models_total Total number of registered active models\n")
+	buf.WriteString("# TYPE gpu_router_models_total gauge\n")
+	fmt.Fprintf(&buf, "gpu_router_models_total %d\n\n", len(pools))
+
+	buf.WriteString("# HELP gpu_router_backends_total Total number of backends\n")
+	buf.WriteString("# TYPE gpu_router_backends_total gauge\n")
+	fmt.Fprintf(&buf, "gpu_router_backends_total %d\n\n", totalTargets)
+
+	buf.WriteString("# HELP gpu_router_backend_active_connections Number of in-flight active connections per backend\n")
+	buf.WriteString("# TYPE gpu_router_backend_active_connections gauge\n")
+
+	buf.WriteString("# HELP gpu_router_backend_healthy Backend healthy state (1 = healthy, 0 = isolated)\n")
+	buf.WriteString("# TYPE gpu_router_backend_healthy gauge\n")
+
+	buf.WriteString("# HELP gpu_router_backend_consecutive_failures Consecutive failure count\n")
+	buf.WriteString("# TYPE gpu_router_backend_consecutive_failures gauge\n")
+
+	buf.WriteString("# HELP gpu_router_backend_requests_success_total Total successful requests\n")
+	buf.WriteString("# TYPE gpu_router_backend_requests_success_total counter\n")
+
+	buf.WriteString("# HELP gpu_router_backend_requests_failed_total Total failed requests\n")
+	buf.WriteString("# TYPE gpu_router_backend_requests_failed_total counter\n")
+
+	for mName, pool := range pools {
+		for _, t := range pool.Targets {
+			active := atomic.LoadInt64(&t.ActiveConns)
+			fmt.Fprintf(&buf, "gpu_router_backend_active_connections{model=%q,target=%q} %d\n", mName, t.URLString, active)
+
+			healthyVal := 0
+			consecFails := 0
+			var succ, fails int64
+			if t.CircuitBreaker != nil {
+				_, consecFails, succ, fails = t.CircuitBreaker.GetMetrics()
+				if t.CircuitBreaker.CanExecute() {
+					healthyVal = 1
+				}
+			}
+			fmt.Fprintf(&buf, "gpu_router_backend_healthy{model=%q,target=%q} %d\n", mName, t.URLString, healthyVal)
+			fmt.Fprintf(&buf, "gpu_router_backend_consecutive_failures{model=%q,target=%q} %d\n", mName, t.URLString, consecFails)
+			fmt.Fprintf(&buf, "gpu_router_backend_requests_success_total{model=%q,target=%q} %d\n", mName, t.URLString, succ)
+			fmt.Fprintf(&buf, "gpu_router_backend_requests_failed_total{model=%q,target=%q} %d\n", mName, t.URLString, fails)
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+

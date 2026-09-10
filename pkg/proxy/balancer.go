@@ -19,15 +19,17 @@ import (
 
 // BackendTarget represents a single worker node endpoint.
 type BackendTarget struct {
-	URL         *url.URL
-	URLString   string
-	ActiveConns int64
-	Healthy     bool
+	URL            *url.URL
+	URLString      string
+	ActiveConns    int64
+	Healthy        bool
+	CircuitBreaker *CircuitBreaker
 }
 
 // Balancer is the interface for load balancing algorithms.
 type Balancer interface {
 	SelectTarget(r *http.Request) (*BackendTarget, error)
+	SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error)
 	SetTargets(targets []*BackendTarget)
 	GetTargets() []*BackendTarget
 	RecordRequestStart(target *BackendTarget)
@@ -62,6 +64,19 @@ func (b *BaseBalancer) RecordRequestEnd(target *BackendTarget) {
 	atomic.AddInt64(&target.ActiveConns, -1)
 }
 
+func (b *BaseBalancer) getAvailableTargets(excluded map[string]bool) []*BackendTarget {
+	var available []*BackendTarget
+	for _, t := range b.targets {
+		if excluded != nil && excluded[t.URLString] {
+			continue
+		}
+		if t.CircuitBreaker == nil || t.CircuitBreaker.CanExecute() {
+			available = append(available, t)
+		}
+	}
+	return available
+}
+
 // --- Round Robin Balancer ---
 
 type RoundRobinBalancer struct {
@@ -76,15 +91,23 @@ func NewRoundRobinBalancer(targets []*BackendTarget) *RoundRobinBalancer {
 }
 
 func (b *RoundRobinBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *RoundRobinBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	if len(b.targets) == 0 {
-		return nil, errors.New("no healthy backends available")
+	available := b.getAvailableTargets(excluded)
+	if len(available) == 0 {
+		if len(excluded) > 0 {
+			return nil, errors.New("no alternative healthy backends available for failover")
+		}
+		return nil, errors.New("all backends are currently isolated by circuit breaker (OPEN)")
 	}
 
-	idx := atomic.AddUint64(&b.counter, 1) % uint64(len(b.targets))
-	return b.targets[idx], nil
+	idx := atomic.AddUint64(&b.counter, 1) % uint64(len(available))
+	return available[idx], nil
 }
 
 // --- Random Balancer ---
@@ -100,15 +123,23 @@ func NewRandomBalancer(targets []*BackendTarget) *RandomBalancer {
 }
 
 func (b *RandomBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *RandomBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	if len(b.targets) == 0 {
-		return nil, errors.New("no healthy backends available")
+	available := b.getAvailableTargets(excluded)
+	if len(available) == 0 {
+		if len(excluded) > 0 {
+			return nil, errors.New("no alternative healthy backends available for failover")
+		}
+		return nil, errors.New("all backends are currently isolated by circuit breaker (OPEN)")
 	}
 
-	idx := rand.Intn(len(b.targets))
-	return b.targets[idx], nil
+	idx := rand.Intn(len(available))
+	return available[idx], nil
 }
 
 // --- Power of Two Choices (P2C) Balancer ---
@@ -124,15 +155,23 @@ func NewPowerOfTwoBalancer(targets []*BackendTarget) *PowerOfTwoBalancer {
 }
 
 func (b *PowerOfTwoBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *PowerOfTwoBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	n := len(b.targets)
+	available := b.getAvailableTargets(excluded)
+	n := len(available)
 	if n == 0 {
-		return nil, errors.New("no healthy backends available")
+		if len(excluded) > 0 {
+			return nil, errors.New("no alternative healthy backends available for failover")
+		}
+		return nil, errors.New("all backends are currently isolated by circuit breaker (OPEN)")
 	}
 	if n == 1 {
-		return b.targets[0], nil
+		return available[0], nil
 	}
 
 	// Pick two distinct random indices
@@ -142,8 +181,8 @@ func (b *PowerOfTwoBalancer) SelectTarget(r *http.Request) (*BackendTarget, erro
 		i2++
 	}
 
-	t1 := b.targets[i1]
-	t2 := b.targets[i2]
+	t1 := available[i1]
+	t2 := available[i2]
 
 	// Choose the one with fewer active connections
 	if atomic.LoadInt64(&t1.ActiveConns) <= atomic.LoadInt64(&t2.ActiveConns) {
@@ -193,23 +232,45 @@ func (b *ConsistentHashBalancer) SetTargets(targets []*BackendTarget) {
 }
 
 func (b *ConsistentHashBalancer) SelectTarget(r *http.Request) (*BackendTarget, error) {
+	return b.SelectTargetExcluding(r, nil)
+}
+
+func (b *ConsistentHashBalancer) SelectTargetExcluding(r *http.Request, excluded map[string]bool) (*BackendTarget, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if len(b.targets) == 0 || len(b.ring) == 0 {
-		return nil, errors.New("no healthy backends available")
+		return nil, errors.New("no backends available in pool")
 	}
 
 	key := extractSessionKey(r)
 	h := hashKey(key)
 
 	// Binary search for first ring node >= h
-	idx := sort.Search(len(b.ring), func(i int) bool { return b.ring[i] >= h })
-	if idx >= len(b.ring) {
-		idx = 0
+	startIdx := sort.Search(len(b.ring), func(i int) bool { return b.ring[i] >= h })
+	if startIdx >= len(b.ring) {
+		startIdx = 0
 	}
 
-	return b.ringMap[b.ring[idx]], nil
+	// Walk the hash ring to find first target that is not excluded and can execute
+	for i := 0; i < len(b.ring); i++ {
+		idx := (startIdx + i) % len(b.ring)
+		target := b.ringMap[b.ring[idx]]
+		if target == nil {
+			continue
+		}
+		if excluded != nil && excluded[target.URLString] {
+			continue
+		}
+		if target.CircuitBreaker == nil || target.CircuitBreaker.CanExecute() {
+			return target, nil
+		}
+	}
+
+	if len(excluded) > 0 {
+		return nil, errors.New("no alternative healthy backends available for failover on hash ring")
+	}
+	return nil, errors.New("all backends on hash ring are currently isolated by circuit breaker (OPEN)")
 }
 
 func hashKey(s string) uint32 {

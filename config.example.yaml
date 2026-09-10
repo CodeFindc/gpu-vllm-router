@@ -22,8 +22,11 @@ target:
 
 # 路由器服务配置
 router:
-  # 运行模式: cmd | proxy | run
-  mode: "cmd"
+  # 运行模式:
+  # - proxy: (推荐默认) 纯 Go 原生高可用网关，全集群多模型自动聚合，内置断路器与透明故障转移，零外部依赖
+  # - run:   守护并管理官方 Rust 版 vllm-router 进程池，支持蓝绿无损热重载
+  # - cmd:   仅查询实例并输出官方启动命令
+  mode: "proxy"
   host: "0.0.0.0"
   port: 8000
   router_bin: "vllm-router"
@@ -32,3 +35,17 @@ router:
   # run 模式蓝绿无损热重载配置
   zero_downtime: true
   drain_timeout: 60s
+
+# 熔断器 (Circuit Breaker) 与故障自愈配置 (Proxy 模式)
+circuit_breaker:
+  # 是否开启断路器与透明重试故障转移
+  enabled: true
+  # 实例连续失败达到此阈值后立即触发熔断隔离 (State: OPEN)，毫秒级移出可用路由池，不等待轮询
+  max_failures: 3
+  # 熔断隔离冷却时间，到期后自动进入半开试探状态 (State: HALF_OPEN)
+  cooldown: 10s
+  # 单个请求遭遇故障/重启节点时的最大透明重试与故障转移次数 (Failover Retries)
+  max_retries: 2
+  # 后台对处于熔断隔离状态的节点进行主动健康嗅探与自愈恢复的探测周期
+  health_check_interval: 3s
+
