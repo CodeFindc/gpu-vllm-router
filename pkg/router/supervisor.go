@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"gpu-vllm-router/pkg/gpustack"
+	"gpu-vllm-router/pkg/swagger"
 )
 
 // WorkerBreaker tracks health and circuit breaker status of a backend worker instance in mode: run.
@@ -311,6 +312,11 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/admin/supervisor", s.handleSupervisorStatus)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/swagger/", swagger.Handler)
+	mux.HandleFunc("/swagger/doc.json", swagger.DocJSONHandler)
+	mux.HandleFunc("/openapi.json", swagger.DocJSONHandler)
+	mux.HandleFunc("/docs", swagger.DocsRedirectHandler)
+	mux.HandleFunc("/redoc", swagger.RedocHandler)
 	mux.HandleFunc("/", s.handleProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.PublicPort)
@@ -322,6 +328,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	go func() {
 		log.Printf("[Supervisor] Front Gateway listening on http://%s (Managing %d model router processes, Zero-Downtime=%t)",
 			addr, len(s.runners), s.cfg.ZeroDowntime)
+		log.Printf("[Supervisor] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
 		if err := s.frontServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[Supervisor] Front proxy server error: %v", err)
 		}

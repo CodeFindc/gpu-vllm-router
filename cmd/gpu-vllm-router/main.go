@@ -302,6 +302,10 @@ func main() {
 		fmt.Printf("  -H \"Content-Type: application/json\" \\\n")
 		fmt.Printf("  -H \"X-Session-ID: session_12345\" \\\n")
 		fmt.Printf("  -d '{\"model\": \"%s\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}]}'\n", sampleModelName)
+		fmt.Println("\n>>> 5. 在线 Swagger / OpenAPI 文档地址 (在 proxy 或 run 模式下生效):")
+		fmt.Printf("  - Swagger UI:  http://127.0.0.1:%d/docs (或 /swagger/)\n", *port)
+		fmt.Printf("  - ReDoc UI:    http://127.0.0.1:%d/redoc\n", *port)
+		fmt.Printf("  - OpenAPI Spec: http://127.0.0.1:%d/openapi.json\n", *port)
 
 	case "run":
 		log.Printf("正在以守护进程模式启动官方 vllm-router (%s)...", *routerBin)

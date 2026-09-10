@@ -473,17 +473,25 @@ circuit_breaker:
 
 ---
 
-## 十、管理与监控接口
+## 十、管理、监控与 Swagger 交互文档接口
 
-当程序以 `-mode proxy` 或 `-mode run` 运行时，对外提供统一的管理端点：
+当程序以 `-mode proxy` 或 `-mode run` 运行时，对外提供统一的管理端点与交互式 API 文档：
 
 | 端点路径 | 请求方法 | 说明 |
 | :--- | :---: | :--- |
+| `/docs` 或 `/swagger/` | `GET` | **Swagger UI 交互式 API 调试文档**，支持在线 "Try it out" 调试、参数模型与架构说明 |
+| `/redoc` | `GET` | **ReDoc 现代化三栏技术参考文档** |
+| `/openapi.json` | `GET` | OpenAPI 3.0.3 规范 JSON 描述文件（支持直接导入 Postman / Apifox） |
 | `/health` | `GET` | 路由器健康检查接口，正常返回 `{"status":"ok"}` |
-| `/admin/stats` | `GET` | *(Proxy 模式)* 查看全集群各模型的 Worker 列表、健康状态、实时活跃连接数及生效策略 |
-| `/admin/supervisor` | `GET` | *(Run 模式)* 查看 Supervisor 守护状态、当前主力内部端口、后端 Worker 总数及零停机运行状态 |
+| `/metrics` | `GET` | Prometheus 性能监控指标接口，包含各模型请求计数、活跃连接数及熔断指标 |
+| `/admin/stats` | `GET` | *(Proxy 模式)* 查看全集群各模型的 Worker 列表、健康状态、熔断状态（OPEN/CLOSED/HALF_OPEN）、实时活跃连接数及生效策略 |
+| `/admin/supervisor` | `GET` | *(Run 模式)* 查看 Supervisor 守护状态、当前主力内部端口、后端 Worker 总数、各 Worker 熔断嗅探状态及零停机运行状态 |
 | `/v1/models` | `GET` | OpenAI 兼容模型列表接口，自动聚合全集群所有处于 `running` 状态的模型供前端调用 |
-| `/v1/chat/completions` | `POST` | OpenAI 兼容聊天接口，按请求体 `model` 自动分发，支持流式 (`stream: true`) SSE 传输 |
+| `/v1/chat/completions` | `POST` | OpenAI 兼容聊天接口，按请求体 `model` 自动分发，支持流式 (`stream: true`) SSE 传输与会话粘性亲和头 (`X-Session-ID`, `X-User-ID`) |
+| `/v1/completions` | `POST` | OpenAI 兼容文本补全接口 |
+| `/v1/embeddings` | `POST` | OpenAI 兼容向量计算接口 |
+
+> 离线规范文件已归档于 [`docs/openapi.json`](docs/openapi.json) 与 [`docs/openapi.yaml`](docs/openapi.yaml)，详细说明请参见 [API 文档指南](docs/README.md)。
 
 ---
 

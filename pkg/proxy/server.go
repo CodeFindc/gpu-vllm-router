@@ -19,6 +19,7 @@ import (
 
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/router"
+	"gpu-vllm-router/pkg/swagger"
 )
 
 // ServerConfig configures the native Go reverse proxy server.
@@ -379,6 +380,11 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/swagger/", swagger.Handler)
+	mux.HandleFunc("/swagger/doc.json", swagger.DocJSONHandler)
+	mux.HandleFunc("/openapi.json", swagger.DocJSONHandler)
+	mux.HandleFunc("/docs", swagger.DocsRedirectHandler)
+	mux.HandleFunc("/redoc", swagger.RedocHandler)
 	mux.Handle("/", s.reverseProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
@@ -395,6 +401,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	log.Printf("[Proxy] Native Multi-Model Load Balancer running on http://%s (Policy: %s, MaxRetries: %d)",
 		addr, s.cfg.Policy, s.cfg.CircuitBreaker.MaxRetries)
+	log.Printf("[Proxy] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("proxy server failed: %w", err)
