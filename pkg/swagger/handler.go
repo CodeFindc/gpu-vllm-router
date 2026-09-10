@@ -69,6 +69,7 @@ const swaggerUIHTML = `<!DOCTYPE html>
       🚀 GPUStack vLLM Router
     </a>
     <div class="nav-links">
+      <a href="/dashboard">🖥️ Web 控制台</a>
       <a href="/redoc" target="_blank">📖 ReDoc View</a>
       <a href="/admin/stats" target="_blank">📊 Cluster Stats</a>
       <a href="/metrics" target="_blank">📈 Prometheus Metrics</a>

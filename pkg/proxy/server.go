@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/router"
 	"gpu-vllm-router/pkg/swagger"
@@ -385,6 +386,14 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/openapi.json", swagger.DocJSONHandler)
 	mux.HandleFunc("/docs", swagger.DocsRedirectHandler)
 	mux.HandleFunc("/redoc", swagger.RedocHandler)
+	dashHandler := dashboard.NewHandler(s)
+	mux.Handle("/dashboard/", dashHandler)
+	mux.Handle("/dashboard", dashHandler)
+	mux.Handle("/ui/", dashHandler)
+	mux.Handle("/ui", dashHandler)
+	mux.Handle("/api/topology", dashHandler)
+	mux.Handle("/api/probe", dashHandler)
+	mux.Handle("/api/reset-breaker", dashHandler)
 	mux.Handle("/", s.reverseProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
@@ -401,6 +410,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	log.Printf("[Proxy] Native Multi-Model Load Balancer running on http://%s (Policy: %s, MaxRetries: %d)",
 		addr, s.cfg.Policy, s.cfg.CircuitBreaker.MaxRetries)
+	log.Printf("[Proxy] Web Dashboard console:    http://%s/dashboard (or /ui)", addr)
 	log.Printf("[Proxy] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
 
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -798,4 +808,134 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(buf.Bytes())
 }
+
+// GetTopology satisfies dashboard.TopologyProvider interface for Mode: Proxy.
+func (s *Server) GetTopology(ctx context.Context) (*dashboard.TopologyData, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var totalConns int64
+	healthyWorkers := 0
+	totalWorkers := len(s.allTargets)
+
+	var modelsTopo []dashboard.ModelTopology
+
+	for mName, pool := range s.modelPools {
+		var workersTopo []dashboard.WorkerTopology
+		var modelConns int64
+		modelHealthy := 0
+
+		for _, t := range pool.Targets {
+			conns := atomic.LoadInt64(&t.ActiveConns)
+			modelConns += conns
+			totalConns += conns
+
+			state := StateClosed
+			fails := 0
+			healthy := true
+			lastProbeStr := ""
+			lastErr := ""
+			if t.CircuitBreaker != nil {
+				state, fails, _ = t.CircuitBreaker.GetStatus()
+				healthy = t.CircuitBreaker.CanExecute()
+			}
+			if healthy {
+				modelHealthy++
+			}
+
+			workersTopo = append(workersTopo, dashboard.WorkerTopology{
+				URL:                 t.URLString,
+				ActiveConns:         conns,
+				Healthy:             healthy,
+				CircuitState:        string(state),
+				ConsecutiveFailures: fails,
+				LastErr:             lastErr,
+				LastProbe:           lastProbeStr,
+			})
+		}
+
+		modelsTopo = append(modelsTopo, dashboard.ModelTopology{
+			ModelName:    mName,
+			Policy:       string(s.cfg.Policy),
+			WorkerCount:  len(pool.Targets),
+			HealthyCount: modelHealthy,
+			ActiveConns:  modelConns,
+			Workers:      workersTopo,
+		})
+	}
+
+	for _, t := range s.allTargets {
+		if t.CircuitBreaker != nil && t.CircuitBreaker.CanExecute() {
+			healthyWorkers++
+		} else if t.CircuitBreaker == nil && t.Healthy {
+			healthyWorkers++
+		}
+	}
+
+	clusterHealth := "healthy"
+	if healthyWorkers == 0 && totalWorkers > 0 {
+		clusterHealth = "unhealthy"
+	} else if healthyWorkers < totalWorkers {
+		clusterHealth = "degraded"
+	}
+
+	return &dashboard.TopologyData{
+		Mode:             "proxy",
+		Policy:           string(s.cfg.Policy),
+		PublicAddr:       fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port),
+		ClusterHealth:    clusterHealth,
+		TotalModels:      len(s.modelPools),
+		TotalWorkers:     totalWorkers,
+		HealthyWorkers:   healthyWorkers,
+		TotalActiveConns: totalConns,
+		Models:           modelsTopo,
+		ServerTimeUTC:    time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// ProbeWorker triggers an active probe on a target backend worker.
+func (s *Server) ProbeWorker(ctx context.Context, workerURL string) (bool, error) {
+	s.mu.RLock()
+	var foundTarget *BackendTarget
+	for _, t := range s.allTargets {
+		if t.URLString == workerURL {
+			foundTarget = t
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if foundTarget == nil {
+		return false, fmt.Errorf("worker %s not found", workerURL)
+	}
+
+	if foundTarget.CircuitBreaker != nil {
+		ok := foundTarget.CircuitBreaker.Probe()
+		return ok, nil
+	}
+	return true, nil
+}
+
+// ResetBreaker resets the circuit breaker for a worker.
+func (s *Server) ResetBreaker(ctx context.Context, workerURL string) error {
+	s.mu.RLock()
+	var foundTarget *BackendTarget
+	for _, t := range s.allTargets {
+		if t.URLString == workerURL {
+			foundTarget = t
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if foundTarget == nil {
+		return fmt.Errorf("worker %s not found", workerURL)
+	}
+
+	if foundTarget.CircuitBreaker != nil {
+		foundTarget.CircuitBreaker.Reset()
+	}
+	return nil
+}
+
 

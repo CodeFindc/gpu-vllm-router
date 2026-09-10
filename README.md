@@ -479,6 +479,7 @@ circuit_breaker:
 
 | 端点路径 | 请求方法 | 说明 |
 | :--- | :---: | :--- |
+| `/dashboard` 或 `/ui` | `GET` | **React 现代化可视化运维控制台**，动态呈现多模型路由架构拓扑流、各 Worker 节点并发负载进度条、断路器熔断状态机及在线推理测试台 |
 | `/docs` 或 `/swagger/` | `GET` | **Swagger UI 交互式 API 调试文档**，支持在线 "Try it out" 调试、参数模型与架构说明 |
 | `/redoc` | `GET` | **ReDoc 现代化三栏技术参考文档** |
 | `/openapi.json` | `GET` | OpenAPI 3.0.3 规范 JSON 描述文件（支持直接导入 Postman / Apifox） |

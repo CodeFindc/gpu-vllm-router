@@ -192,3 +192,14 @@ func (cb *CircuitBreaker) Probe() bool {
 
 	return false
 }
+
+// Reset manually resets the circuit breaker to CLOSED state and clears failures.
+func (cb *CircuitBreaker) Reset() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.state = StateClosed
+	cb.consecutiveFailures = 0
+	cb.lastStateChange = time.Now()
+	log.Printf("[CircuitBreaker] 🟢 Target %s manually reset to CLOSED", cb.targetURL)
+}

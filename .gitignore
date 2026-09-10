@@ -26,3 +26,8 @@ Thumbs.db
 # Local configuration with credentials
 config.yaml
 
+# Node / Frontend dependencies
+node_modules/
+web/node_modules/
+web/dist/
+

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/swagger"
 )
@@ -317,6 +318,14 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	mux.HandleFunc("/openapi.json", swagger.DocJSONHandler)
 	mux.HandleFunc("/docs", swagger.DocsRedirectHandler)
 	mux.HandleFunc("/redoc", swagger.RedocHandler)
+	dashHandler := dashboard.NewHandler(s)
+	mux.Handle("/dashboard/", dashHandler)
+	mux.Handle("/dashboard", dashHandler)
+	mux.Handle("/ui/", dashHandler)
+	mux.Handle("/ui", dashHandler)
+	mux.Handle("/api/topology", dashHandler)
+	mux.Handle("/api/probe", dashHandler)
+	mux.Handle("/api/reset-breaker", dashHandler)
 	mux.HandleFunc("/", s.handleProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.PublicPort)
@@ -328,6 +337,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	go func() {
 		log.Printf("[Supervisor] Front Gateway listening on http://%s (Managing %d model router processes, Zero-Downtime=%t)",
 			addr, len(s.runners), s.cfg.ZeroDowntime)
+		log.Printf("[Supervisor] Web Dashboard console:    http://%s/dashboard (or /ui)", addr)
 		log.Printf("[Supervisor] Swagger UI documentation: http://%s/docs (OpenAPI spec: /openapi.json)", addr)
 		if err := s.frontServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("[Supervisor] Front proxy server error: %v", err)
@@ -1127,3 +1137,136 @@ func (s *Supervisor) Stop() {
 		runner.mu.Unlock()
 	}
 }
+
+// GetTopology satisfies dashboard.TopologyProvider interface for Mode: Run.
+func (s *Supervisor) GetTopology(ctx context.Context) (*dashboard.TopologyData, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.workerMu.RLock()
+	defer s.workerMu.RUnlock()
+
+	var modelsTopo []dashboard.ModelTopology
+	totalWorkers := len(s.workerStates)
+	healthyWorkers := 0
+
+	for mName, runner := range s.runners {
+		runner.mu.RLock()
+		var workersTopo []dashboard.WorkerTopology
+		modelHealthy := 0
+
+		for _, u := range runner.AllURLs {
+			wb := s.workerStates[u]
+			isHealthy := true
+			state := "CLOSED"
+			fails := 0
+			lastErr := ""
+			lastProbeStr := ""
+
+			if wb != nil {
+				isHealthy = wb.Healthy
+				if !isHealthy {
+					state = "OPEN"
+				}
+				fails = wb.ConsecutiveFails
+				lastErr = wb.LastErr
+				if !wb.LastProbe.IsZero() {
+					lastProbeStr = wb.LastProbe.Format(time.RFC3339)
+				}
+			}
+
+			if isHealthy {
+				modelHealthy++
+			}
+
+			workersTopo = append(workersTopo, dashboard.WorkerTopology{
+				URL:                 u,
+				ActiveConns:         0,
+				Healthy:             isHealthy,
+				CircuitState:        state,
+				ConsecutiveFailures: fails,
+				LastErr:             lastErr,
+				LastProbe:           lastProbeStr,
+			})
+		}
+		runner.mu.RUnlock()
+
+		modelsTopo = append(modelsTopo, dashboard.ModelTopology{
+			ModelName:    mName,
+			Policy:       string(s.cfg.RouterCfg.Policy),
+			WorkerCount:  len(runner.AllURLs),
+			HealthyCount: modelHealthy,
+			Workers:      workersTopo,
+		})
+	}
+
+	for _, wb := range s.workerStates {
+		if wb.Healthy {
+			healthyWorkers++
+		}
+	}
+
+	clusterHealth := "healthy"
+	if healthyWorkers == 0 && totalWorkers > 0 {
+		clusterHealth = "unhealthy"
+	} else if healthyWorkers < totalWorkers {
+		clusterHealth = "degraded"
+	}
+
+	return &dashboard.TopologyData{
+		Mode:             "run",
+		Policy:           string(s.cfg.RouterCfg.Policy),
+		PublicAddr:       fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.PublicPort),
+		ClusterHealth:    clusterHealth,
+		TotalModels:      len(s.runners),
+		TotalWorkers:     totalWorkers,
+		HealthyWorkers:   healthyWorkers,
+		TotalActiveConns: 0,
+		Models:           modelsTopo,
+		ServerTimeUTC:    time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
+// ProbeWorker triggers an active health probe on a target backend worker.
+func (s *Supervisor) ProbeWorker(ctx context.Context, workerURL string) (bool, error) {
+	var ok bool
+	var err error
+	if s.probeWorkerFunc != nil {
+		ok, err = s.probeWorkerFunc(ctx, workerURL)
+	} else {
+		ok, err = s.probeWorker(ctx, workerURL)
+	}
+
+	s.workerMu.Lock()
+	wb, exists := s.workerStates[workerURL]
+	if !exists {
+		wb = &WorkerBreaker{URL: workerURL, Healthy: true}
+		s.workerStates[workerURL] = wb
+	}
+	wb.LastProbe = time.Now()
+	if ok {
+		wb.Healthy = true
+		wb.ConsecutiveFails = 0
+		wb.LastErr = ""
+	} else {
+		wb.ConsecutiveFails++
+		wb.LastErr = fmt.Sprintf("%v", err)
+	}
+	s.workerMu.Unlock()
+
+	return ok, err
+}
+
+// ResetBreaker manually restores a worker breaker to healthy state.
+func (s *Supervisor) ResetBreaker(ctx context.Context, workerURL string) error {
+	s.workerMu.Lock()
+	wb, exists := s.workerStates[workerURL]
+	if exists {
+		wb.Healthy = true
+		wb.ConsecutiveFails = 0
+		wb.LastErr = ""
+		wb.OpenSince = time.Time{}
+	}
+	s.workerMu.Unlock()
+	return nil
+}
+
