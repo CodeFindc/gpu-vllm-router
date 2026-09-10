@@ -19,6 +19,25 @@ type Config struct {
 	PrefillURLs       []string `json:"prefill_urls"`
 	DecodeURLs        []string `json:"decode_urls"`
 	ExtraArgs         []string `json:"extra_args"`
+
+	// Built-in Circuit Breaker options for official vllm-router
+	CbFailureThreshold    int  `json:"cb_failure_threshold,omitempty"`     // --cb-failure-threshold
+	CbSuccessThreshold    int  `json:"cb_success_threshold,omitempty"`     // --cb-success-threshold
+	CbTimeoutDurationSecs int  `json:"cb_timeout_duration_secs,omitempty"` // --cb-timeout-duration-secs
+	CbWindowDurationSecs  int  `json:"cb_window_duration_secs,omitempty"`  // --cb-window-duration-secs
+	DisableCircuitBreaker bool `json:"disable_circuit_breaker,omitempty"`  // --disable-circuit-breaker
+
+	// Built-in Retry options for official vllm-router
+	RetryMaxRetries       int  `json:"retry_max_retries,omitempty"`        // --retry-max-retries
+	RetryInitialBackoffMs int  `json:"retry_initial_backoff_ms,omitempty"` // --retry-initial-backoff-ms
+	DisableRetries        bool `json:"disable_retries,omitempty"`          // --disable-retries
+
+	// Built-in Health Check options for official vllm-router
+	HealthFailureThreshold  int    `json:"health_failure_threshold,omitempty"`   // --health-failure-threshold
+	HealthSuccessThreshold  int    `json:"health_success_threshold,omitempty"`   // --health-success-threshold
+	HealthCheckTimeoutSecs  int    `json:"health_check_timeout_secs,omitempty"`  // --health-check-timeout-secs
+	HealthCheckIntervalSecs int    `json:"health_check_interval_secs,omitempty"` // --health-check-interval-secs
+	HealthCheckEndpoint     string `json:"health_check_endpoint,omitempty"`      // --health-check-endpoint
 }
 
 // BuildArgs constructs the slice of command line arguments for vllm-router.
@@ -66,6 +85,51 @@ func BuildArgs(cfg Config) []string {
 	} else if len(cfg.WorkerURLs) > 0 {
 		args = append(args, "--worker-urls")
 		args = append(args, cfg.WorkerURLs...)
+	}
+
+	// Circuit Breaker CLI flags
+	if cfg.CbFailureThreshold > 0 {
+		args = append(args, "--cb-failure-threshold", fmt.Sprintf("%d", cfg.CbFailureThreshold))
+	}
+	if cfg.CbSuccessThreshold > 0 {
+		args = append(args, "--cb-success-threshold", fmt.Sprintf("%d", cfg.CbSuccessThreshold))
+	}
+	if cfg.CbTimeoutDurationSecs > 0 {
+		args = append(args, "--cb-timeout-duration-secs", fmt.Sprintf("%d", cfg.CbTimeoutDurationSecs))
+	}
+	if cfg.CbWindowDurationSecs > 0 {
+		args = append(args, "--cb-window-duration-secs", fmt.Sprintf("%d", cfg.CbWindowDurationSecs))
+	}
+	if cfg.DisableCircuitBreaker {
+		args = append(args, "--disable-circuit-breaker")
+	}
+
+	// Retry CLI flags
+	if cfg.RetryMaxRetries > 0 {
+		args = append(args, "--retry-max-retries", fmt.Sprintf("%d", cfg.RetryMaxRetries))
+	}
+	if cfg.RetryInitialBackoffMs > 0 {
+		args = append(args, "--retry-initial-backoff-ms", fmt.Sprintf("%d", cfg.RetryInitialBackoffMs))
+	}
+	if cfg.DisableRetries {
+		args = append(args, "--disable-retries")
+	}
+
+	// Health Check CLI flags
+	if cfg.HealthFailureThreshold > 0 {
+		args = append(args, "--health-failure-threshold", fmt.Sprintf("%d", cfg.HealthFailureThreshold))
+	}
+	if cfg.HealthSuccessThreshold > 0 {
+		args = append(args, "--health-success-threshold", fmt.Sprintf("%d", cfg.HealthSuccessThreshold))
+	}
+	if cfg.HealthCheckTimeoutSecs > 0 {
+		args = append(args, "--health-check-timeout-secs", fmt.Sprintf("%d", cfg.HealthCheckTimeoutSecs))
+	}
+	if cfg.HealthCheckIntervalSecs > 0 {
+		args = append(args, "--health-check-interval-secs", fmt.Sprintf("%d", cfg.HealthCheckIntervalSecs))
+	}
+	if cfg.HealthCheckEndpoint != "" {
+		args = append(args, "--health-check-endpoint", cfg.HealthCheckEndpoint)
 	}
 
 	if len(cfg.ExtraArgs) > 0 {

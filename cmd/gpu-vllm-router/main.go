@@ -258,6 +258,37 @@ func main() {
 		LogLevel:         "info",
 	}
 
+	if fileCfg != nil {
+		if fileCfg.CircuitBreaker.MaxFailures > 0 {
+			routerCfg.CbFailureThreshold = fileCfg.CircuitBreaker.MaxFailures
+		}
+		if fileCfg.CircuitBreaker.SuccessThreshold > 0 {
+			routerCfg.CbSuccessThreshold = fileCfg.CircuitBreaker.SuccessThreshold
+		}
+		if fileCfg.CircuitBreaker.Cooldown > 0 {
+			routerCfg.CbTimeoutDurationSecs = int(fileCfg.CircuitBreaker.Cooldown.Seconds())
+		}
+		if fileCfg.CircuitBreaker.WindowDuration > 0 {
+			routerCfg.CbWindowDurationSecs = int(fileCfg.CircuitBreaker.WindowDuration.Seconds())
+		}
+		if fileCfg.CircuitBreaker.MaxRetries > 0 {
+			routerCfg.RetryMaxRetries = fileCfg.CircuitBreaker.MaxRetries
+		}
+		if fileCfg.CircuitBreaker.RetryInitialBackoff > 0 {
+			routerCfg.RetryInitialBackoffMs = int(fileCfg.CircuitBreaker.RetryInitialBackoff.Milliseconds())
+		}
+		if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
+			routerCfg.HealthCheckIntervalSecs = int(fileCfg.CircuitBreaker.HealthCheckInterval.Seconds())
+		}
+		if fileCfg.CircuitBreaker.HealthCheckTimeout > 0 {
+			routerCfg.HealthCheckTimeoutSecs = int(fileCfg.CircuitBreaker.HealthCheckTimeout.Seconds())
+		}
+		if fileCfg.CircuitBreaker.Enabled != nil && !*fileCfg.CircuitBreaker.Enabled {
+			routerCfg.DisableCircuitBreaker = true
+			routerCfg.DisableRetries = true
+		}
+	}
+
 	switch *mode {
 	case "cmd":
 		fmt.Println(">>> 1. Linux / macOS (Bash) 启动命令:")

@@ -68,3 +68,58 @@ func TestParsePolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildArgsWithCircuitBreaker(t *testing.T) {
+	cfg := Config{
+		Host:                    "0.0.0.0",
+		Port:                    8000,
+		Policy:                  PolicyConsistentHash,
+		WorkerURLs:              []string{"http://10.0.0.1:8000", "http://10.0.0.2:8000"},
+		CbFailureThreshold:      5,
+		CbSuccessThreshold:      2,
+		CbTimeoutDurationSecs:   30,
+		CbWindowDurationSecs:    60,
+		RetryMaxRetries:         3,
+		RetryInitialBackoffMs:   50,
+		HealthCheckIntervalSecs: 10,
+		HealthCheckTimeoutSecs:  5,
+		HealthCheckEndpoint:     "/health",
+	}
+
+	args := BuildArgs(cfg)
+	cmdStr := strings.Join(args, " ")
+
+	expectedFlags := []string{
+		"--cb-failure-threshold 5",
+		"--cb-success-threshold 2",
+		"--cb-timeout-duration-secs 30",
+		"--cb-window-duration-secs 60",
+		"--retry-max-retries 3",
+		"--retry-initial-backoff-ms 50",
+		"--health-check-interval-secs 10",
+		"--health-check-timeout-secs 5",
+		"--health-check-endpoint /health",
+	}
+
+	for _, flag := range expectedFlags {
+		if !strings.Contains(cmdStr, flag) {
+			t.Errorf("expected command string to contain %q, but got: %s", flag, cmdStr)
+		}
+	}
+
+	// Test disable flags
+	cfgDisabled := Config{
+		Host:                  "0.0.0.0",
+		Port:                  8000,
+		WorkerURLs:            []string{"http://10.0.0.1:8000"},
+		DisableCircuitBreaker: true,
+		DisableRetries:        true,
+	}
+	cmdDisabledStr := strings.Join(BuildArgs(cfgDisabled), " ")
+	if !strings.Contains(cmdDisabledStr, "--disable-circuit-breaker") {
+		t.Errorf("expected --disable-circuit-breaker in %s", cmdDisabledStr)
+	}
+	if !strings.Contains(cmdDisabledStr, "--disable-retries") {
+		t.Errorf("expected --disable-retries in %s", cmdDisabledStr)
+	}
+}

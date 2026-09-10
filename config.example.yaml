@@ -36,16 +36,25 @@ router:
   zero_downtime: true
   drain_timeout: 60s
 
-# 熔断器 (Circuit Breaker) 与故障自愈配置 (Proxy 模式)
+# 熔断器 (Circuit Breaker) 与故障转移配置
+# (统一生效于 mode: proxy 原生网关、mode: run 官方守护进程双层防护、以及 mode: cmd 生成命令)
 circuit_breaker:
   # 是否开启断路器与透明重试故障转移
   enabled: true
-  # 实例连续失败达到此阈值后立即触发熔断隔离 (State: OPEN)，毫秒级移出可用路由池，不等待轮询
+  # 连续请求失败达到此阈值后立即触发熔断隔离 (State: OPEN)；对齐官方 --cb-failure-threshold
   max_failures: 3
-  # 熔断隔离冷却时间，到期后自动进入半开试探状态 (State: HALF_OPEN)
+  # 半开试探阶段所需的连续成功次数恢复健康；对齐官方 --cb-success-threshold
+  success_threshold: 2
+  # 熔断隔离冷却等待时长，到期后进入半开试探 (State: HALF_OPEN)；对齐官方 --cb-timeout-duration-secs
   cooldown: 10s
-  # 单个请求遭遇故障/重启节点时的最大透明重试与故障转移次数 (Failover Retries)
+  # 故障统计滑动时间窗口；对齐官方 --cb-window-duration-secs
+  window_duration: 60s
+  # 单个请求遭遇故障/节点重启时的最大重试次数；对齐官方 --retry-max-retries
   max_retries: 2
-  # 后台对处于熔断隔离状态的节点进行主动健康嗅探与自愈恢复的探测周期
+  # 初始退避等待时长；对齐官方 --retry-initial-backoff-ms
+  retry_initial_backoff: 50ms
+  # 后台主动健康探测周期；对齐官方 --health-check-interval-secs 与 Supervisor 嗅探周期
   health_check_interval: 3s
+  # 健康探测超时时长；对齐官方 --health-check-timeout-secs
+  health_check_timeout: 5s
 

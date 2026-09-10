@@ -39,9 +39,13 @@ type RouterConfig struct {
 type CircuitBreakerConfig struct {
 	Enabled             *bool         `yaml:"enabled"`
 	MaxFailures         int           `yaml:"max_failures"`
+	SuccessThreshold    int           `yaml:"success_threshold"`
 	Cooldown            time.Duration `yaml:"cooldown"`
+	WindowDuration      time.Duration `yaml:"window_duration"`
 	MaxRetries          int           `yaml:"max_retries"`
+	RetryInitialBackoff time.Duration `yaml:"retry_initial_backoff"`
 	HealthCheckInterval time.Duration `yaml:"health_check_interval"`
+	HealthCheckTimeout  time.Duration `yaml:"health_check_timeout"`
 }
 
 // FileConfig represents the full structure of config.yaml.
