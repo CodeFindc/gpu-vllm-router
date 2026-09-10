@@ -1,15 +1,10 @@
 # ==============================================================================
-# 阶段 1: 编译官方最新 vllm-project/router Rust 二进制 (配置国内镜像源)
+# 阶段 1: 编译官方最新 vllm-project/router Rust 二进制 (Standard / International)
 # ==============================================================================
 ARG REGISTRY_MIRROR=""
 FROM ${REGISTRY_MIRROR}rustlang/rust:nightly-bookworm AS vllm-router-builder
 
-# 配置 Debian 国内阿里云镜像源并开启 [trusted=yes] 避免 GPG NO_PUBKEY 报错
-RUN rm -f /etc/apt/sources.list.d/debian.sources && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib" > /etc/apt/sources.list && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian-security/ bookworm-security main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     build-essential \
     pkg-config \
@@ -18,30 +13,19 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 配置 Rust / Cargo 国内稀疏索引加速 (rsproxy.cn)
-ENV RUSTUP_DIST_SERVER=https://rsproxy.cn
-ENV RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
-RUN mkdir -p /root/.cargo && \
-    echo '[source.crates-io]' > /root/.cargo/config.toml && \
-    echo 'replace-with = "rsproxy-sparse"' >> /root/.cargo/config.toml && \
-    echo '[source.rsproxy-sparse]' >> /root/.cargo/config.toml && \
-    echo 'registry = "sparse+https://rsproxy.cn/index/"' >> /root/.cargo/config.toml && \
-    echo '[net]' >> /root/.cargo/config.toml && \
-    echo 'git-fetch-with-cli = true' >> /root/.cargo/config.toml
-
-# 拉取最新官方 vllm-project/router 源码并编译 release 二进制 (支持 GitHub 镜像代理)
-ARG GH_PROXY="https://ghfast.top/"
+# 拉取最新官方 vllm-project/router 源码并编译 release 二进制
+ARG GH_PROXY=""
 WORKDIR /src
 RUN git clone --depth 1 ${GH_PROXY}https://github.com/vllm-project/router.git /src/router
 WORKDIR /src/router
 RUN cargo build --release
 
 # ==============================================================================
-# 阶段 2: 编译 gpu-vllm-router (Go 服务，配置 goproxy.cn)
+# 阶段 2: 编译 gpu-vllm-router (Go 调度服务与内嵌 React 运维控制台)
 # ==============================================================================
 FROM ${REGISTRY_MIRROR}golang:1.22-bookworm AS go-builder
 
-ARG GOPROXY="https://goproxy.cn,direct"
+ARG GOPROXY=""
 ENV GOPROXY=${GOPROXY}
 ENV GO111MODULE=on
 
@@ -57,12 +41,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /src/gpu-vllm-router/b
 # ==============================================================================
 FROM ${REGISTRY_MIRROR}debian:bookworm-slim
 
-# 配置运行时 Debian 阿里云镜像源
-RUN rm -f /etc/apt/sources.list.d/debian.sources && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm main non-free non-free-firmware contrib" > /etc/apt/sources.list && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian/ bookworm-updates main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
-    echo "deb [trusted=yes] http://mirrors.aliyun.com/debian-security/ bookworm-security main non-free non-free-firmware contrib" >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     libssl3 \
@@ -70,9 +49,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources && \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# 设置时区
-ENV TZ=Asia/Shanghai
-
+# 默认设置 UTC 时区 (可通过环境变量 TZ 自由覆盖)
+ENV TZ=UTC
 WORKDIR /app
 
 # 从构建阶段复制二进制可执行文件
@@ -84,7 +62,7 @@ RUN chmod +x /usr/local/bin/vllm-router /usr/local/bin/gpu-vllm-router
 # 拷贝示例配置作为容器内默认备用配置
 COPY config.example.yaml /app/config.yaml
 
-# 暴露对外统一服务端口
+# 暴露对外统一服务端口 (包含 OpenAI 接口、Swagger/ReDoc 文档与 React 控制台)
 EXPOSE 8000
 
 # 容器健康检查

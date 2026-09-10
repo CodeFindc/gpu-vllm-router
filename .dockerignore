@@ -1,7 +1,9 @@
 .git
 *.exe
-gpu-vllm-router-linux
 *.log
 tmp/
 .vscode/
 .idea/
+node_modules/
+web/node_modules/
+web/dist/

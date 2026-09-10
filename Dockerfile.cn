@@ -1,6 +1,7 @@
 # ==============================================================================
 # Dockerfile.cn: 专为国内服务器优化的全套加速镜像构建文件
 # 涵盖: Debian APT 阿里云加速([trusted=yes])、Rust rsproxy 稀疏索引、Go goproxy.cn、GitHub 代理加速
+# 内置: 全集群多模型自动聚合、React 可视化控制台、Swagger 交互式文档与双层熔断
 # ==============================================================================
 
 ARG REGISTRY_MIRROR=""
@@ -39,7 +40,7 @@ WORKDIR /src/router
 RUN cargo build --release
 
 # ==============================================================================
-# 阶段 2: 编译 gpu-vllm-router (Go 调度服务，配置国内七牛云 goproxy.cn)
+# 阶段 2: 编译 gpu-vllm-router (Go 调度服务与内嵌 React 运维控制台，配置国内七牛云 goproxy.cn)
 # ==============================================================================
 FROM ${REGISTRY_MIRROR}golang:1.22-bookworm AS go-builder
 
@@ -84,6 +85,7 @@ RUN chmod +x /usr/local/bin/vllm-router /usr/local/bin/gpu-vllm-router
 # 拷贝示例配置作为备用
 COPY config.example.yaml /app/config.yaml
 
+# 暴露对外统一服务端口 (包含 OpenAI 接口、Swagger/ReDoc 文档与 React 控制台)
 EXPOSE 8000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \

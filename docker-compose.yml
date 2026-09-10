@@ -7,8 +7,8 @@ services:
       dockerfile: Dockerfile
       args:
         REGISTRY_MIRROR: ""
-        GH_PROXY: "https://ghfast.top/"
-        GOPROXY: "https://goproxy.cn,direct"
+        GH_PROXY: ""
+        GOPROXY: "https://proxy.golang.org,direct"
     image: gpu-vllm-router:latest
     container_name: gpu-vllm-router
     restart: unless-stopped
