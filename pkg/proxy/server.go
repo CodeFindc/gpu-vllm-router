@@ -350,36 +350,50 @@ func (s *Server) errorHandler(w http.ResponseWriter, req *http.Request, err erro
 // Start boots the proxy server and watches GPUStack instances.
 func (s *Server) Start(ctx context.Context) error {
 	// Initial endpoint discovery
-	if s.cfg.ModelName != "" {
-		// Single Model Mode
-		endpoints, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
-		if err != nil {
-			return fmt.Errorf("initial discovery failed for model %q: %w", s.cfg.ModelName, err)
+	if s.client != nil {
+		if s.cfg.ModelName != "" {
+			// Single Model Mode
+			endpoints, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.cfg.ModelName)
+			if err != nil {
+				log.Printf("[Proxy] ⚠️ Initial discovery warning for model %q: %v. Entering STANDBY mode...", s.cfg.ModelName, err)
+			} else if len(endpoints) == 0 {
+				log.Printf("[Proxy] ⚠️ Warning: no running instances found for model %q in GPUStack at startup. Entering STANDBY mode...", s.cfg.ModelName)
+			} else {
+				log.Printf("[Proxy] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
+				s.updateSingleModelEndpoints(s.cfg.ModelName, endpoints)
+			}
+		} else {
+			// Full Cluster Multi-Model Mode
+			cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
+			if err != nil {
+				log.Printf("[Proxy] ⚠️ Cluster-wide model discovery warning: %v. Entering STANDBY mode...", err)
+			} else if cluster == nil || cluster.InstanceCount == 0 {
+				log.Printf("[Proxy] ⚠️ Warning: no running model instances found across entire GPUStack cluster at startup. Entering STANDBY mode...")
+			} else {
+				log.Printf("[Proxy] [Multi-Model] Discovered %d active model(s) and %d running instance(s) in cluster:",
+					cluster.ModelCount, cluster.InstanceCount)
+				s.updateClusterEndpoints(cluster)
+			}
 		}
-		if len(endpoints) == 0 {
-			return fmt.Errorf("no running instances found for model %q in GPUStack", s.cfg.ModelName)
-		}
-		log.Printf("[Proxy] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
-		s.updateSingleModelEndpoints(s.cfg.ModelName, endpoints)
 	} else {
-		// Full Cluster Multi-Model Mode
-		cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
-		if err != nil {
-			return fmt.Errorf("cluster-wide model discovery failed: %w", err)
-		}
-		if cluster.InstanceCount == 0 {
-			return errors.New("no running model instances found across entire GPUStack cluster")
-		}
-		log.Printf("[Proxy] [Multi-Model] Discovered %d active model(s) and %d running instance(s) in cluster:",
-			cluster.ModelCount, cluster.InstanceCount)
-		s.updateClusterEndpoints(cluster)
+		log.Printf("[Proxy] Standby mode: running without active GPUStack client.")
 	}
 
 	// Setup HTTP handler multiplexer
 	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/stats", s.handleStats)
-	mux.HandleFunc("/metrics", s.handleMetrics)
+
+	// Health & liveness probes (K8s & unified convention)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/livez", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleHealth)
+	mux.HandleFunc("/ping", s.handleHealth)
+
+	// Admin stats & supervisor status (Unified dual-mode support)
+	mux.HandleFunc("/admin/stats", s.handleStats)
+	mux.HandleFunc("/admin/supervisor", s.handleStats)
+
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/swagger/", swagger.Handler)
 	mux.HandleFunc("/swagger/doc.json", swagger.DocJSONHandler)
@@ -394,7 +408,17 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.Handle("/api/topology", dashHandler)
 	mux.Handle("/api/probe", dashHandler)
 	mux.Handle("/api/reset-breaker", dashHandler)
-	mux.Handle("/", s.reverseProxy)
+	mux.Handle("/api/health", dashHandler)
+
+	// Root handler with smart browser redirect to /dashboard
+	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && r.Method == http.MethodGet && r.URL.Query().Get("model") == "" {
+			http.Redirect(w, r, "/dashboard", http.StatusFound)
+			return
+		}
+		s.reverseProxy.ServeHTTP(w, r)
+	})
+	mux.Handle("/", rootHandler)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	s.httpServer = &http.Server{
@@ -576,6 +600,9 @@ func (s *Server) probeLoop(ctx context.Context) {
 }
 
 func (s *Server) watchLoop(ctx context.Context) {
+	if s.client == nil {
+		return
+	}
 	ticker := time.NewTicker(s.cfg.WatchInterval)
 	defer ticker.Stop()
 
@@ -637,8 +664,23 @@ func (s *Server) watchLoop(ctx context.Context) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	count := len(s.modelPools)
+	s.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path == "/readyz" && count == 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"standby","message":"waiting for model instances to be ready"}`))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	if count == 0 {
+		_, _ = w.Write([]byte(`{"status":"ok","standby":true,"models":0}`))
+		return
+	}
+	_, _ = w.Write([]byte(fmt.Sprintf(`{"status":"ok","models":%d}`, count)))
 }
 
 // handleModels returns OpenAI-compatible /v1/models response containing all available models.
@@ -838,6 +880,11 @@ func (s *Server) GetTopology(ctx context.Context) (*dashboard.TopologyData, erro
 			if t.CircuitBreaker != nil {
 				state, fails, _ = t.CircuitBreaker.GetStatus()
 				healthy = t.CircuitBreaker.CanExecute()
+				probeTime, errStr := t.CircuitBreaker.GetLastProbeAndError()
+				if !probeTime.IsZero() {
+					lastProbeStr = probeTime.Format(time.RFC3339)
+				}
+				lastErr = errStr
 			}
 			if healthy {
 				modelHealthy++
@@ -897,8 +944,9 @@ func (s *Server) GetTopology(ctx context.Context) (*dashboard.TopologyData, erro
 func (s *Server) ProbeWorker(ctx context.Context, workerURL string) (bool, error) {
 	s.mu.RLock()
 	var foundTarget *BackendTarget
+	trimmed := strings.TrimRight(workerURL, "/")
 	for _, t := range s.allTargets {
-		if t.URLString == workerURL {
+		if strings.TrimRight(t.URLString, "/") == trimmed {
 			foundTarget = t
 			break
 		}
@@ -920,8 +968,9 @@ func (s *Server) ProbeWorker(ctx context.Context, workerURL string) (bool, error
 func (s *Server) ResetBreaker(ctx context.Context, workerURL string) error {
 	s.mu.RLock()
 	var foundTarget *BackendTarget
+	trimmed := strings.TrimRight(workerURL, "/")
 	for _, t := range s.allTargets {
-		if t.URLString == workerURL {
+		if strings.TrimRight(t.URLString, "/") == trimmed {
 			foundTarget = t
 			break
 		}

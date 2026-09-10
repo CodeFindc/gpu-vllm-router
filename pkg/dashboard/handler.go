@@ -44,6 +44,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleProbe(w, r)
 	case path == "/api/reset-breaker":
 		h.handleResetBreaker(w, r)
+	case path == "/api/health":
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	default:
 		// If subpath of /dashboard/, serve UI
 		if strings.HasPrefix(path, "/dashboard") {
@@ -109,7 +113,8 @@ func (h *Handler) handleProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ok, err := h.provider.ProbeWorker(r.Context(), req.URL)
+	targetURL := strings.TrimRight(req.URL, "/")
+	ok, err := h.provider.ProbeWorker(r.Context(), targetURL)
 	msg := "probe succeeded"
 	if !ok || err != nil {
 		if err != nil {
@@ -157,7 +162,8 @@ func (h *Handler) handleResetBreaker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.provider.ResetBreaker(r.Context(), req.URL)
+	targetURL := strings.TrimRight(req.URL, "/")
+	err := h.provider.ResetBreaker(r.Context(), targetURL)
 	msg := "circuit breaker reset to CLOSED"
 	if err != nil {
 		msg = err.Error()

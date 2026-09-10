@@ -200,51 +200,63 @@ func main() {
 		// Single Model Mode
 		endpoints, model, err := client.GetRunningWorkerEndpoints(ctx, *modelName)
 		if err != nil {
-			log.Fatalf("发现模型实例失败: %v", err)
+			if *mode == "cmd" {
+				log.Fatalf("发现模型实例失败: %v", err)
+			}
+			log.Printf("⚠️ 发现模型实例警告 (启动进入待机模式): %v", err)
 		}
 		if len(endpoints) == 0 {
-			log.Fatalf("模型 %q (ID: %d) 当前没有处于 running 状态的实例工作点！", model.Name, model.ID)
+			if *mode == "cmd" {
+				log.Fatalf("模型 %q 当前没有处于 running 状态的实例工作点！", *modelName)
+			}
+			log.Printf("⚠️ 模型 %q 当前没有处于 running 状态的实例工作点 (启动进入待机模式)", *modelName)
+		} else {
+			sampleModelName = model.Name
+			fmt.Println("\n================= GPUStack 单模型实例服务发现结果 =================")
+			fmt.Printf("模型名称: %s (ID: %d, 后端: %s)\n", model.Name, model.ID, model.Backend)
+			fmt.Printf("健康工作点数量: %d\n", len(endpoints))
+			fmt.Println("-------------------------------------------------------------------")
+			fmt.Printf("%-18s | %-15s | %-16s | %-6s | %s\n", "实例名称", "Worker 节点", "IP 地址", "端口", "工作点接入 URL")
+			fmt.Println("-------------------------------------------------------------------")
+			for _, ep := range endpoints {
+				fmt.Printf("%-18s | %-15s | %-16s | %-6d | %s\n", ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+				workerURLs = append(workerURLs, ep.URL)
+			}
+			fmt.Println("===================================================================")
+			fmt.Println()
 		}
-		sampleModelName = model.Name
-
-		fmt.Println("\n================= GPUStack 单模型实例服务发现结果 =================")
-		fmt.Printf("模型名称: %s (ID: %d, 后端: %s)\n", model.Name, model.ID, model.Backend)
-		fmt.Printf("健康工作点数量: %d\n", len(endpoints))
-		fmt.Println("-------------------------------------------------------------------")
-		fmt.Printf("%-18s | %-15s | %-16s | %-6s | %s\n", "实例名称", "Worker 节点", "IP 地址", "端口", "工作点接入 URL")
-		fmt.Println("-------------------------------------------------------------------")
-		for _, ep := range endpoints {
-			fmt.Printf("%-18s | %-15s | %-16s | %-6d | %s\n", ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
-			workerURLs = append(workerURLs, ep.URL)
-		}
-		fmt.Println("===================================================================")
-		fmt.Println()
 	} else {
 		// Full Cluster Multi-Model Mode
 		cluster, err := client.GetAllRunningWorkerEndpoints(ctx)
 		if err != nil {
-			log.Fatalf("全集群服务发现失败: %v", err)
-		}
-		if cluster.InstanceCount == 0 {
-			log.Fatalf("GPUStack 集群当前没有处于 running 状态的任何模型实例！")
-		}
-
-		fmt.Println("\n================= GPUStack 全集群多模型服务发现结果 =================")
-		fmt.Printf("在线模型数量: %d | 运行中工作点总数: %d\n", cluster.ModelCount, cluster.InstanceCount)
-		fmt.Println("-------------------------------------------------------------------")
-		for mName, eps := range cluster.ModelsEndpoints {
-			if sampleModelName == "" {
-				sampleModelName = mName
+			if *mode == "cmd" {
+				log.Fatalf("全集群服务发现失败: %v", err)
 			}
-			fmt.Printf("▶ 模型: %s (就绪副本: %d)\n", mName, len(eps))
-			for _, ep := range eps {
-				fmt.Printf("    -> 实例: %-25s Worker: %-12s IP: %-15s 端口: %-6d URL: %s\n",
-					ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
-				workerURLs = append(workerURLs, ep.URL)
-			}
+			log.Printf("⚠️ 全集群服务发现警告 (启动进入待机模式): %v", err)
 		}
-		fmt.Println("===================================================================")
-		fmt.Println()
+		if cluster == nil || cluster.InstanceCount == 0 {
+			if *mode == "cmd" {
+				log.Fatalf("GPUStack 集群当前没有处于 running 状态的任何模型实例！")
+			}
+			log.Printf("⚠️ GPUStack 集群当前没有处于 running 状态的模型实例 (启动进入待机模式，将在后台自动同步感知)")
+		} else {
+			fmt.Println("\n================= GPUStack 全集群多模型服务发现结果 =================")
+			fmt.Printf("在线模型数量: %d | 运行中工作点总数: %d\n", cluster.ModelCount, cluster.InstanceCount)
+			fmt.Println("-------------------------------------------------------------------")
+			for mName, eps := range cluster.ModelsEndpoints {
+				if sampleModelName == "" {
+					sampleModelName = mName
+				}
+				fmt.Printf("▶ 模型: %s (就绪副本: %d)\n", mName, len(eps))
+				for _, ep := range eps {
+					fmt.Printf("    -> 实例: %-25s Worker: %-12s IP: %-15s 端口: %-6d URL: %s\n",
+						ep.InstanceName, ep.WorkerName, ep.IP, ep.Port, ep.URL)
+					workerURLs = append(workerURLs, ep.URL)
+				}
+			}
+			fmt.Println("===================================================================")
+			fmt.Println()
+		}
 	}
 
 	routerCfg := router.Config{

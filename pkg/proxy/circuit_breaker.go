@@ -46,6 +46,8 @@ type CircuitBreaker struct {
 	totalSuccesses      int64
 	lastStateChange     time.Time
 	lastFailureTime     time.Time
+	lastProbeTime       time.Time
+	lastError           string
 	httpClient          *http.Client
 }
 
@@ -108,6 +110,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 
 	cb.totalSuccesses++
 	cb.consecutiveFailures = 0
+	cb.lastError = ""
 
 	if cb.state == StateHalfOpen || cb.state == StateOpen {
 		cb.state = StateClosed
@@ -124,6 +127,9 @@ func (cb *CircuitBreaker) RecordFailure(err error) {
 	cb.totalFailures++
 	cb.consecutiveFailures++
 	cb.lastFailureTime = time.Now()
+	if err != nil {
+		cb.lastError = err.Error()
+	}
 
 	log.Printf("[CircuitBreaker] Target %s failure #%d: %v", cb.targetURL, cb.consecutiveFailures, err)
 
@@ -158,36 +164,66 @@ func (cb *CircuitBreaker) GetMetrics() (state CircuitState, consecutiveFails int
 	return cb.state, cb.consecutiveFailures, cb.totalSuccesses, cb.totalFailures
 }
 
+// GetLastProbeAndError returns the timestamp of the last health probe and the last recorded error message.
+func (cb *CircuitBreaker) GetLastProbeAndError() (time.Time, string) {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.lastProbeTime, cb.lastError
+}
+
 // Probe actively tests the health of the target via /health or /v1/models.
 func (cb *CircuitBreaker) Probe() bool {
+	cb.mu.Lock()
+	cb.lastProbeTime = time.Now()
+	cb.mu.Unlock()
+
 	probeURL := fmt.Sprintf("%s/health", cb.targetURL)
 	req, err := http.NewRequest(http.MethodGet, probeURL, nil)
-	if err != nil {
-		return false
-	}
-
-	resp, err := cb.httpClient.Do(req)
 	if err == nil {
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			cb.RecordSuccess()
-			return true
+		resp, err := cb.httpClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				cb.RecordSuccess()
+				return true
+			}
+			cb.mu.Lock()
+			cb.lastError = fmt.Sprintf("probe /health returned HTTP %d", resp.StatusCode)
+			cb.mu.Unlock()
+		} else {
+			cb.mu.Lock()
+			cb.lastError = fmt.Sprintf("probe /health error: %v", err)
+			cb.mu.Unlock()
 		}
+	} else {
+		cb.mu.Lock()
+		cb.lastError = fmt.Sprintf("probe /health request error: %v", err)
+		cb.mu.Unlock()
 	}
 
 	// Fallback to /v1/models
 	modelsURL := fmt.Sprintf("%s/v1/models", cb.targetURL)
-	req2, err := http.NewRequest(http.MethodGet, modelsURL, nil)
-	if err != nil {
-		return false
-	}
-	resp2, err := cb.httpClient.Do(req2)
-	if err == nil {
-		resp2.Body.Close()
-		if resp2.StatusCode == http.StatusOK {
-			cb.RecordSuccess()
-			return true
+	req2, err2 := http.NewRequest(http.MethodGet, modelsURL, nil)
+	if err2 == nil {
+		resp2, err2 := cb.httpClient.Do(req2)
+		if err2 == nil {
+			resp2.Body.Close()
+			if resp2.StatusCode == http.StatusOK {
+				cb.RecordSuccess()
+				return true
+			}
+			cb.mu.Lock()
+			cb.lastError = fmt.Sprintf("probe /v1/models returned HTTP %d", resp2.StatusCode)
+			cb.mu.Unlock()
+		} else {
+			cb.mu.Lock()
+			cb.lastError = fmt.Sprintf("probe /v1/models error: %v", err2)
+			cb.mu.Unlock()
 		}
+	} else {
+		cb.mu.Lock()
+		cb.lastError = fmt.Sprintf("probe /v1/models request error: %v", err2)
+		cb.mu.Unlock()
 	}
 
 	return false
@@ -200,6 +236,7 @@ func (cb *CircuitBreaker) Reset() {
 
 	cb.state = StateClosed
 	cb.consecutiveFailures = 0
+	cb.lastError = ""
 	cb.lastStateChange = time.Now()
 	log.Printf("[CircuitBreaker] 🟢 Target %s manually reset to CLOSED", cb.targetURL)
 }

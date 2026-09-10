@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gpu-vllm-router/pkg/dashboard"
@@ -63,6 +64,7 @@ type ModelRunner struct {
 	ActiveTarget *url.URL
 	ActiveURLs   []string
 	AllURLs      []string
+	activeConns  int64
 	reloading    bool
 }
 
@@ -74,11 +76,12 @@ type Supervisor struct {
 	modelName string
 	cfg       SupervisorConfig
 
-	mu           sync.RWMutex
-	runners      map[string]*ModelRunner
-	currentProc  *runningProcess // for backward compatibility & single-model direct access
-	activeTarget *url.URL         // for backward compatibility & single-model direct access
-	activeURLs   []string         // for backward compatibility & single-model direct access
+	mu               sync.RWMutex
+	runners          map[string]*ModelRunner
+	totalActiveConns int64
+	currentProc      *runningProcess // for backward compatibility & single-model direct access
+	activeTarget     *url.URL         // for backward compatibility & single-model direct access
+	activeURLs       []string         // for backward compatibility & single-model direct access
 
 	workerMu     sync.RWMutex
 	workerStates map[string]*WorkerBreaker
@@ -231,87 +234,94 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	s.runners = make(map[string]*ModelRunner)
 	s.mu.Unlock()
 
-	if s.modelName != "" {
-		// Single Model Mode
-		endpoints, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.modelName)
-		if err != nil {
-			return fmt.Errorf("initial discovery failed for model %q: %w", s.modelName, err)
-		}
-		if len(endpoints) == 0 {
-			return fmt.Errorf("no running instances found for model %q in GPUStack", s.modelName)
-		}
-		var urls []string
-		log.Printf("[Supervisor] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
-		for _, ep := range endpoints {
-			log.Printf("  -> Instance: %-25s Worker: %-15s Endpoint: %s", ep.InstanceName, ep.WorkerName, ep.URL)
-			urls = append(urls, ep.URL)
-		}
-		sort.Strings(urls)
-
-		runner, err := s.startModelRunner(ctx, model.Name, urls)
-		if err != nil {
-			return fmt.Errorf("failed to start router for model %s: %w", model.Name, err)
-		}
-		runner.AllURLs = urls
-		s.initWorkers(urls)
-
-		s.mu.Lock()
-		s.runners[model.Name] = runner
-		s.currentProc = runner.CurrentProc
-		s.activeTarget = runner.ActiveTarget
-		s.activeURLs = urls
-		s.mu.Unlock()
-	} else {
-		// Cluster-wide Multi-Model Pool Mode
-		cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
-		if err != nil {
-			return fmt.Errorf("cluster-wide model discovery failed: %w", err)
-		}
-		if cluster.InstanceCount == 0 {
-			return fmt.Errorf("no running model instances found across entire GPUStack cluster")
-		}
-		log.Printf("[Supervisor] [Multi-Model Router Pool] Discovered %d model(s) and %d running instance(s) in cluster:",
-			cluster.ModelCount, cluster.InstanceCount)
-
-		for mName, eps := range cluster.ModelsEndpoints {
-			var urls []string
-			for _, ep := range eps {
-				urls = append(urls, ep.URL)
-			}
-			sort.Strings(urls)
-			log.Printf("[Supervisor] Initializing vllm-router process for model %q with %d worker(s)...", mName, len(urls))
-
-			runner, err := s.startModelRunner(ctx, mName, urls)
+	if s.client != nil {
+		if s.modelName != "" {
+			// Single Model Mode
+			endpoints, model, err := s.client.GetRunningWorkerEndpoints(ctx, s.modelName)
 			if err != nil {
-				log.Printf("[Supervisor] Warning: failed to start router for model %q: %v", mName, err)
-				continue
-			}
-			runner.AllURLs = urls
-			s.initWorkers(urls)
+				log.Printf("[Supervisor] ⚠️ Initial discovery warning for model %q: %v. Entering STANDBY mode...", s.modelName, err)
+			} else if len(endpoints) == 0 {
+				log.Printf("[Supervisor] ⚠️ Warning: no running instances found for model %q in GPUStack at startup. Entering STANDBY mode...", s.modelName)
+			} else {
+				var urls []string
+				log.Printf("[Supervisor] Discovered %d running instance(s) for model %s (ID: %d):", len(endpoints), model.Name, model.ID)
+				for _, ep := range endpoints {
+					log.Printf("  -> Instance: %-25s Worker: %-15s Endpoint: %s", ep.InstanceName, ep.WorkerName, ep.URL)
+					urls = append(urls, ep.URL)
+				}
+				sort.Strings(urls)
 
-			s.mu.Lock()
-			s.runners[mName] = runner
-			if s.activeTarget == nil {
-				s.activeTarget = runner.ActiveTarget
+				runner, err := s.startModelRunner(ctx, model.Name, urls)
+				if err != nil {
+					return fmt.Errorf("failed to start router for model %s: %w", model.Name, err)
+				}
+				runner.AllURLs = urls
+				s.initWorkers(urls)
+
+				s.mu.Lock()
+				s.runners[model.Name] = runner
 				s.currentProc = runner.CurrentProc
+				s.activeTarget = runner.ActiveTarget
 				s.activeURLs = urls
+				s.mu.Unlock()
 			}
-			s.mu.Unlock()
-		}
+		} else {
+			// Cluster-wide Multi-Model Pool Mode
+			cluster, err := s.client.GetAllRunningWorkerEndpoints(ctx)
+			if err != nil {
+				log.Printf("[Supervisor] ⚠️ Cluster-wide model discovery warning: %v. Entering STANDBY mode...", err)
+			} else if cluster == nil || cluster.InstanceCount == 0 {
+				log.Printf("[Supervisor] ⚠️ Warning: no running model instances found across entire GPUStack cluster at startup. Entering STANDBY mode...")
+			} else {
+				log.Printf("[Supervisor] [Multi-Model Router Pool] Discovered %d model(s) and %d running instance(s) in cluster:",
+					cluster.ModelCount, cluster.InstanceCount)
 
-		s.mu.RLock()
-		activeCount := len(s.runners)
-		s.mu.RUnlock()
-		if activeCount == 0 {
-			return fmt.Errorf("failed to initialize any vllm-router instances for cluster models")
+				for mName, eps := range cluster.ModelsEndpoints {
+					var urls []string
+					for _, ep := range eps {
+						urls = append(urls, ep.URL)
+					}
+					sort.Strings(urls)
+					log.Printf("[Supervisor] Initializing vllm-router process for model %q with %d worker(s)...", mName, len(urls))
+
+					runner, err := s.startModelRunner(ctx, mName, urls)
+					if err != nil {
+						log.Printf("[Supervisor] Warning: failed to start router for model %q: %v", mName, err)
+						continue
+					}
+					runner.AllURLs = urls
+					s.initWorkers(urls)
+
+					s.mu.Lock()
+					s.runners[mName] = runner
+					if s.activeTarget == nil {
+						s.activeTarget = runner.ActiveTarget
+						s.currentProc = runner.CurrentProc
+						s.activeURLs = urls
+					}
+					s.mu.Unlock()
+				}
+			}
 		}
+	} else {
+		log.Printf("[Supervisor] Standby mode: running without active GPUStack client.")
 	}
 
 	// Start Front Gateway Server on PublicHost:PublicPort
 	mux := http.NewServeMux()
+
+	// Health & liveness probes (K8s & unified convention)
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/livez", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleHealth)
+	mux.HandleFunc("/ping", s.handleHealth)
+
+	// Admin stats & supervisor status (Unified dual-mode support)
 	mux.HandleFunc("/admin/supervisor", s.handleSupervisorStatus)
+	mux.HandleFunc("/admin/stats", s.handleSupervisorStatus)
+
+	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/swagger/", swagger.Handler)
 	mux.HandleFunc("/swagger/doc.json", swagger.DocJSONHandler)
@@ -326,6 +336,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	mux.Handle("/api/topology", dashHandler)
 	mux.Handle("/api/probe", dashHandler)
 	mux.Handle("/api/reset-breaker", dashHandler)
+	mux.Handle("/api/health", dashHandler)
 	mux.HandleFunc("/", s.handleProxy)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.PublicHost, s.cfg.PublicPort)
@@ -393,13 +404,18 @@ func (s *Supervisor) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	if count == 0 {
+	if r.URL.Path == "/readyz" && count == 0 {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"status":"unavailable","message":"no active model routers in supervisor"}`))
+		w.Write([]byte(`{"status":"standby","message":"waiting for model routers to be ready"}`))
 		return
 	}
+
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`))
+	if count == 0 {
+		w.Write([]byte(`{"status":"ok","standby":true,"models":0}`))
+		return
+	}
+	w.Write([]byte(fmt.Sprintf(`{"status":"ok","models":%d}`, count)))
 }
 
 func (s *Supervisor) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -536,6 +552,12 @@ func (s *Supervisor) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
+	// Redirect root browser requests to /dashboard
+	if req.URL.Path == "/" && req.Method == http.MethodGet && req.URL.Query().Get("model") == "" {
+		http.Redirect(w, req, "/dashboard", http.StatusFound)
+		return
+	}
+
 	modelName, _ := inspectModelFromRequest(req)
 	runner, err := s.findRunner(modelName)
 	if err != nil {
@@ -563,6 +585,12 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte(`{"error":{"message":"Router process for model is initializing, please retry shortly","type":"service_unavailable"}}`))
 		return
 	}
+
+	// Track in-flight concurrency
+	atomic.AddInt64(&s.totalActiveConns, 1)
+	defer atomic.AddInt64(&s.totalActiveConns, -1)
+	atomic.AddInt64(&runner.activeConns, 1)
+	defer atomic.AddInt64(&runner.activeConns, -1)
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
@@ -888,6 +916,9 @@ func (s *Supervisor) waitForHealth(ctx context.Context, port int, timeout time.D
 
 // watchLoop periodically checks GPUStack for changes in model instances.
 func (s *Supervisor) watchLoop(ctx context.Context) {
+	if s.client == nil {
+		return
+	}
 	ticker := time.NewTicker(s.cfg.WatchInterval)
 	defer ticker.Stop()
 
@@ -1195,6 +1226,7 @@ func (s *Supervisor) GetTopology(ctx context.Context) (*dashboard.TopologyData, 
 			Policy:       string(s.cfg.RouterCfg.Policy),
 			WorkerCount:  len(runner.AllURLs),
 			HealthyCount: modelHealthy,
+			ActiveConns:  atomic.LoadInt64(&runner.activeConns),
 			Workers:      workersTopo,
 		})
 	}
@@ -1220,7 +1252,7 @@ func (s *Supervisor) GetTopology(ctx context.Context) (*dashboard.TopologyData, 
 		TotalModels:      len(s.runners),
 		TotalWorkers:     totalWorkers,
 		HealthyWorkers:   healthyWorkers,
-		TotalActiveConns: 0,
+		TotalActiveConns: atomic.LoadInt64(&s.totalActiveConns),
 		Models:           modelsTopo,
 		ServerTimeUTC:    time.Now().UTC().Format(time.RFC3339),
 	}, nil
@@ -1236,9 +1268,16 @@ func (s *Supervisor) ProbeWorker(ctx context.Context, workerURL string) (bool, e
 		ok, err = s.probeWorker(ctx, workerURL)
 	}
 
+	trimmed := strings.TrimRight(workerURL, "/")
 	s.workerMu.Lock()
-	wb, exists := s.workerStates[workerURL]
-	if !exists {
+	var wb *WorkerBreaker
+	for u, state := range s.workerStates {
+		if strings.TrimRight(u, "/") == trimmed {
+			wb = state
+			break
+		}
+	}
+	if wb == nil {
 		wb = &WorkerBreaker{URL: workerURL, Healthy: true}
 		s.workerStates[workerURL] = wb
 	}
@@ -1258,13 +1297,16 @@ func (s *Supervisor) ProbeWorker(ctx context.Context, workerURL string) (bool, e
 
 // ResetBreaker manually restores a worker breaker to healthy state.
 func (s *Supervisor) ResetBreaker(ctx context.Context, workerURL string) error {
+	trimmed := strings.TrimRight(workerURL, "/")
 	s.workerMu.Lock()
-	wb, exists := s.workerStates[workerURL]
-	if exists {
-		wb.Healthy = true
-		wb.ConsecutiveFails = 0
-		wb.LastErr = ""
-		wb.OpenSince = time.Time{}
+	for u, wb := range s.workerStates {
+		if strings.TrimRight(u, "/") == trimmed {
+			wb.Healthy = true
+			wb.ConsecutiveFails = 0
+			wb.LastErr = ""
+			wb.OpenSince = time.Time{}
+			break
+		}
 	}
 	s.workerMu.Unlock()
 	return nil

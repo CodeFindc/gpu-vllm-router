@@ -188,3 +188,72 @@ func TestSupervisorMultiModelRouting(t *testing.T) {
 	}
 }
 
+func TestSupervisorEndpointsAndRedirect(t *testing.T) {
+	sup := &Supervisor{
+		runners:      make(map[string]*ModelRunner),
+		workerStates: make(map[string]*WorkerBreaker),
+	}
+
+	// 1. Test Root GET / redirects to /dashboard
+	rwRoot := httptest.NewRecorder()
+	reqRoot, _ := http.NewRequest(http.MethodGet, "/", nil)
+	sup.handleProxy(rwRoot, reqRoot)
+	if rwRoot.Code != http.StatusFound {
+		t.Errorf("expected 302 Found for GET /, got %d", rwRoot.Code)
+	}
+	if rwRoot.Header().Get("Location") != "/dashboard" {
+		t.Errorf("expected redirect location /dashboard, got %s", rwRoot.Header().Get("Location"))
+	}
+
+	// 2. Test Standby Health Checks (0 models)
+	for _, path := range []string{"/health", "/healthz", "/livez", "/ping"} {
+		rw := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet, path, nil)
+		sup.handleHealth(rw, req)
+		if rw.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for %s in standby, got %d", path, rw.Code)
+		}
+		if !strings.Contains(rw.Body.String(), `"standby":true`) {
+			t.Errorf("expected standby:true in %s response, got %s", path, rw.Body.String())
+		}
+	}
+
+	// 3. Test /readyz returns 503 when 0 models
+	rwReady := httptest.NewRecorder()
+	reqReady, _ := http.NewRequest(http.MethodGet, "/readyz", nil)
+	sup.handleHealth(rwReady, reqReady)
+	if rwReady.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable for /readyz with 0 models, got %d", rwReady.Code)
+	}
+
+	// 4. Test /admin/supervisor and /admin/stats
+	rwStats := httptest.NewRecorder()
+	reqStats, _ := http.NewRequest(http.MethodGet, "/admin/stats", nil)
+	sup.handleSupervisorStatus(rwStats, reqStats)
+	if rwStats.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for /admin/stats, got %d", rwStats.Code)
+	}
+	if !strings.Contains(rwStats.Body.String(), `"mode":"supervisor_run_mode"`) {
+		t.Errorf("expected supervisor_run_mode in stats JSON, got %s", rwStats.Body.String())
+	}
+
+	// 5. Test GetTopology with active connections
+	sup.runners["test-model"] = &ModelRunner{
+		ModelName:   "test-model",
+		AllURLs:     []string{"http://worker-1:8000"},
+		activeConns: 3,
+	}
+	sup.totalActiveConns = 3
+	topo, err := sup.GetTopology(context.Background())
+	if err != nil {
+		t.Fatalf("GetTopology failed: %v", err)
+	}
+	if topo.TotalActiveConns != 3 {
+		t.Errorf("expected TotalActiveConns=3, got %d", topo.TotalActiveConns)
+	}
+	if len(topo.Models) != 1 || topo.Models[0].ActiveConns != 3 {
+		t.Errorf("expected model ActiveConns=3, got %v", topo.Models)
+	}
+}
+
+
