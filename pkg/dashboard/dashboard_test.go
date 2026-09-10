@@ -29,6 +29,35 @@ func (m *mockProvider) ResetBreaker(ctx context.Context, workerURL string) error
 	return m.resetErr
 }
 
+func (m *mockProvider) GetConfig(ctx context.Context) (*ConfigSnapshot, error) {
+	return &ConfigSnapshot{
+		Mode:              "proxy",
+		Policy:            "consistent_hash",
+		WatchIntervalSecs: 10,
+		MaxFailures:       3,
+		AvailablePolicies: []string{"consistent_hash", "round_robin"},
+		AvailableModes:    []string{"proxy", "run"},
+		Models: []ModelRuleDTO{
+			{ModelName: "DeepSeek-V4", Mode: "proxy", Policy: "consistent_hash"},
+		},
+	}, nil
+}
+
+func (m *mockProvider) UpdateConfig(ctx context.Context, req ConfigUpdateRequest) (*ConfigSnapshot, error) {
+	return &ConfigSnapshot{
+		Mode:   "run",
+		Policy: "power_of_two",
+	}, nil
+}
+
+func (m *mockProvider) UpdateModelRule(ctx context.Context, req ModelRuleUpdateRequest) (*ConfigSnapshot, error) {
+	return &ConfigSnapshot{
+		Models: []ModelRuleDTO{
+			{ModelName: req.ModelName, Mode: req.Mode, Policy: req.Policy},
+		},
+	}, nil
+}
+
 func TestDashboardUIHandler(t *testing.T) {
 	mock := &mockProvider{
 		data: &TopologyData{
@@ -173,3 +202,68 @@ func TestDashboardTopologyAPI(t *testing.T) {
 		t.Errorf("expected reset success")
 	}
 }
+
+func TestDashboardConfigAPI(t *testing.T) {
+	mock := &mockProvider{}
+	h := NewHandler(mock)
+
+	// 1. Test GET /api/config
+	rwGet := httptest.NewRecorder()
+	reqGet, _ := http.NewRequest(http.MethodGet, "/api/config", nil)
+	h.ServeHTTP(rwGet, reqGet)
+
+	if rwGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /api/config, got %d", rwGet.Code)
+	}
+	var snap ConfigSnapshot
+	if err := json.Unmarshal(rwGet.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("failed to decode config snapshot: %v", err)
+	}
+	if snap.Mode != "proxy" || snap.Policy != "consistent_hash" {
+		t.Errorf("unexpected config snapshot: %+v", snap)
+	}
+
+	// 2. Test POST /api/config
+	newMode := "run"
+	newPolicy := "power_of_two"
+	updateBody, _ := json.Marshal(ConfigUpdateRequest{
+		Mode:   &newMode,
+		Policy: &newPolicy,
+	})
+	rwPost := httptest.NewRecorder()
+	reqPost, _ := http.NewRequest(http.MethodPost, "/api/config", bytes.NewReader(updateBody))
+	h.ServeHTTP(rwPost, reqPost)
+
+	if rwPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for POST /api/config, got %d", rwPost.Code)
+	}
+	var updateResp ConfigUpdateResponse
+	if err := json.Unmarshal(rwPost.Body.Bytes(), &updateResp); err != nil {
+		t.Fatalf("failed to decode update response: %v", err)
+	}
+	if !updateResp.Success || updateResp.Config.Mode != "run" {
+		t.Errorf("unexpected update response: %+v", updateResp)
+	}
+
+	// 3. Test POST /api/models/rule
+	modelBody, _ := json.Marshal(ModelRuleUpdateRequest{
+		ModelName: "Qwen3.6-27B",
+		Mode:      "run",
+		Policy:    "power_of_two",
+	})
+	rwModel := httptest.NewRecorder()
+	reqModel, _ := http.NewRequest(http.MethodPost, "/api/models/rule", bytes.NewReader(modelBody))
+	h.ServeHTTP(rwModel, reqModel)
+
+	if rwModel.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for POST /api/models/rule, got %d", rwModel.Code)
+	}
+	var modelResp ConfigUpdateResponse
+	if err := json.Unmarshal(rwModel.Body.Bytes(), &modelResp); err != nil {
+		t.Fatalf("failed to decode model response: %v", err)
+	}
+	if !modelResp.Success || len(modelResp.Config.Models) == 0 || modelResp.Config.Models[0].ModelName != "Qwen3.6-27B" {
+		t.Errorf("unexpected model rule response: %+v", modelResp)
+	}
+}
+

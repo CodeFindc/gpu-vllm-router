@@ -44,6 +44,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleProbe(w, r)
 	case path == "/api/reset-breaker":
 		h.handleResetBreaker(w, r)
+	case path == "/api/config":
+		if r.Method == http.MethodGet {
+			h.handleGetConfig(w, r)
+		} else if r.Method == http.MethodPost {
+			h.handleUpdateConfig(w, r)
+		} else {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	case path == "/api/models/rule":
+		h.handleUpdateModelRule(w, r)
 	case path == "/api/health":
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -177,4 +187,90 @@ func (h *Handler) handleResetBreaker(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mgr, ok := h.provider.(ConfigManager)
+	if !ok || mgr == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "configuration manager not supported by this provider"})
+		return
+	}
+
+	cfg, err := mgr.GetConfig(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(cfg)
+}
+
+func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mgr, ok := h.provider.(ConfigManager)
+	if !ok || mgr == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: "configuration manager not supported"})
+		return
+	}
+
+	var req ConfigUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: fmt.Sprintf("invalid json payload: %v", err)})
+		return
+	}
+
+	updated, err := mgr.UpdateConfig(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{
+		Success: true,
+		Message: "配置已成功更新并实时热生效",
+		Config:  updated,
+	})
+}
+
+func (h *Handler) handleUpdateModelRule(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	mgr, ok := h.provider.(ConfigManager)
+	if !ok || mgr == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: "configuration manager not supported"})
+		return
+	}
+
+	var req ModelRuleUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ModelName == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: "invalid payload: model_name is required"})
+		return
+	}
+
+	updated, err := mgr.UpdateModelRule(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(ConfigUpdateResponse{
+		Success: true,
+		Message: fmt.Sprintf("模型 %q 规则已成功更新并热生效", req.ModelName),
+		Config:  updated,
+	})
 }

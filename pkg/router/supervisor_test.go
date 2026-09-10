@@ -5,10 +5,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"gpu-vllm-router/pkg/config"
+	"gpu-vllm-router/pkg/dashboard"
 )
 
 func TestGetFreePort(t *testing.T) {
@@ -253,6 +257,86 @@ func TestSupervisorEndpointsAndRedirect(t *testing.T) {
 	}
 	if len(topo.Models) != 1 || topo.Models[0].ActiveConns != 3 {
 		t.Errorf("expected model ActiveConns=3, got %v", topo.Models)
+	}
+}
+
+func TestSupervisorConfigManager(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.yaml")
+
+	sup := NewSupervisor(nil, "", SupervisorConfig{
+		PublicHost:     "127.0.0.1",
+		PublicPort:     9000,
+		ConfigFilePath: cfgPath,
+		RouterCfg: Config{
+			Policy: PolicyConsistentHash,
+		},
+		ZeroDowntime:  true,
+		DrainTimeout: 45 * time.Second,
+		WatchInterval: 10 * time.Second,
+	})
+
+	sup.runners["qwen-7b"] = &ModelRunner{
+		ModelName: "qwen-7b",
+		Mode:      "run",
+		Policy:    PolicyConsistentHash,
+		AllURLs:   []string{"http://127.0.0.1:8001"},
+	}
+
+	ctx := context.Background()
+
+	// 1. GetConfig
+	cfg, err := sup.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg.Mode != "run" || cfg.Policy != "consistent_hash" {
+		t.Errorf("unexpected initial config: %+v", cfg)
+	}
+	if len(cfg.Models) != 1 || cfg.Models[0].ModelName != "qwen-7b" {
+		t.Errorf("expected model qwen-7b in config models, got %+v", cfg.Models)
+	}
+
+	// 2. UpdateModelRule
+	updated, err := sup.UpdateModelRule(ctx, dashboard.ModelRuleUpdateRequest{
+		ModelName: "qwen-7b",
+		Mode:      "proxy",
+		Policy:    "round_robin",
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelRule failed: %v", err)
+	}
+	if len(updated.Models) != 1 || updated.Models[0].Mode != "proxy" || updated.Models[0].Policy != "round_robin" {
+		t.Errorf("expected qwen-7b updated to proxy/round_robin, got: %+v", updated.Models)
+	}
+	if sup.runners["qwen-7b"].Mode != "proxy" {
+		t.Errorf("runner mode not updated in memory: got %s", sup.runners["qwen-7b"].Mode)
+	}
+
+	// 3. UpdateConfig (global)
+	newPolicy := "round_robin"
+	newDowntime := false
+	updated2, err := sup.UpdateConfig(ctx, dashboard.ConfigUpdateRequest{
+		Policy:       &newPolicy,
+		ZeroDowntime: &newDowntime,
+	})
+	if err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if updated2.Policy != "round_robin" || updated2.ZeroDowntime != false {
+		t.Errorf("global config not updated: %+v", updated2)
+	}
+
+	// 4. Verify persistence to disk
+	loaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load saved config from disk: %v", err)
+	}
+	if loaded.Target.Policy != "round_robin" {
+		t.Errorf("saved config target policy mismatch: got %s", loaded.Target.Policy)
+	}
+	if len(loaded.Models) != 1 || loaded.Models[0].Mode != "proxy" {
+		t.Errorf("saved config model rule mismatch: got %+v", loaded.Models)
 	}
 }
 

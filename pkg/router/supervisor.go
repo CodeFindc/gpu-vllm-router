@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/swagger"
@@ -47,7 +48,9 @@ type SupervisorConfig struct {
 	WorkerProbeInterval time.Duration
 	WorkerMaxFailures   int
 
-	RouterCfg Config
+	RouterCfg      Config
+	ConfigFilePath string
+	ModelRules     []config.ModelRule
 }
 
 type runningProcess struct {
@@ -59,6 +62,8 @@ type runningProcess struct {
 // ModelRunner manages a dedicated vllm-router instance for a specific model.
 type ModelRunner struct {
 	ModelName    string
+	Mode         string // "run" (default) or "proxy"
+	Policy       Policy // routing policy for this model
 	mu           sync.RWMutex
 	CurrentProc  *runningProcess
 	ActiveTarget *url.URL
@@ -82,6 +87,9 @@ type Supervisor struct {
 	currentProc      *runningProcess // for backward compatibility & single-model direct access
 	activeTarget     *url.URL         // for backward compatibility & single-model direct access
 	activeURLs       []string         // for backward compatibility & single-model direct access
+
+	configFilePath string
+	modelRules     map[string]config.ModelRule
 
 	workerMu     sync.RWMutex
 	workerStates map[string]*WorkerBreaker
@@ -118,13 +126,20 @@ func NewSupervisor(client *gpustack.Client, modelName string, cfg SupervisorConf
 		cfg.WorkerMaxFailures = 3
 	}
 
+	rulesMap := make(map[string]config.ModelRule)
+	for _, r := range cfg.ModelRules {
+		rulesMap[r.ModelName] = r
+	}
+
 	return &Supervisor{
-		client:       client,
-		modelName:    modelName,
-		cfg:          cfg,
-		runners:      make(map[string]*ModelRunner),
-		workerStates: make(map[string]*WorkerBreaker),
-		stopCh:       make(chan struct{}),
+		client:         client,
+		modelName:      modelName,
+		cfg:            cfg,
+		runners:        make(map[string]*ModelRunner),
+		workerStates:   make(map[string]*WorkerBreaker),
+		stopCh:         make(chan struct{}),
+		configFilePath: cfg.ConfigFilePath,
+		modelRules:     rulesMap,
 	}
 }
 
@@ -140,6 +155,11 @@ func (s *Supervisor) initWorkers(urls []string) {
 			}
 		}
 	}
+}
+
+// GetFreePort finds an available unprivileged TCP port on 127.0.0.1.
+func GetFreePort() (int, error) {
+	return getFreePort()
 }
 
 func getFreePort() (int, error) {
@@ -369,6 +389,31 @@ func (s *Supervisor) doSpawn(ctx context.Context, host string, port int, workerU
 }
 
 func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, workerURLs []string) (*ModelRunner, error) {
+	ruleMode := "run"
+	rulePolicy := s.cfg.RouterCfg.Policy
+	s.mu.RLock()
+	if rule, ok := s.modelRules[modelName]; ok {
+		if rule.Mode != "" {
+			ruleMode = rule.Mode
+		}
+		if rule.Policy != "" {
+			rulePolicy = Policy(rule.Policy)
+		}
+	}
+	s.mu.RUnlock()
+
+	if ruleMode == "proxy" {
+		log.Printf("[Supervisor] Launching model [%s] in direct 'proxy' mode (Workers: %d, Policy: %s)...",
+			modelName, len(workerURLs), rulePolicy)
+		return &ModelRunner{
+			ModelName:  modelName,
+			Mode:       "proxy",
+			Policy:     rulePolicy,
+			ActiveURLs: workerURLs,
+			AllURLs:    workerURLs,
+		}, nil
+	}
+
 	internalPort, err := getFreePort()
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate internal port for %s: %w", modelName, err)
@@ -391,6 +436,8 @@ func (s *Supervisor) startModelRunner(ctx context.Context, modelName string, wor
 
 	return &ModelRunner{
 		ModelName:    modelName,
+		Mode:         "run",
+		Policy:       rulePolicy,
 		CurrentProc:  proc,
 		ActiveTarget: proc.targetURL,
 		ActiveURLs:   workerURLs,
@@ -576,8 +623,69 @@ func (s *Supervisor) handleProxy(w http.ResponseWriter, req *http.Request) {
 	}
 
 	runner.mu.RLock()
+	mode := runner.Mode
 	target := runner.ActiveTarget
+	activeURLs := append([]string(nil), runner.ActiveURLs...)
 	runner.mu.RUnlock()
+
+	if mode == "proxy" {
+		if len(activeURLs) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"No active backends for model %s","type":"bad_gateway"}}`, runner.ModelName)))
+			return
+		}
+
+		var healthyURLs []string
+		s.workerMu.RLock()
+		for _, u := range activeURLs {
+			if wb, ok := s.workerStates[u]; ok && wb.Healthy {
+				healthyURLs = append(healthyURLs, u)
+			}
+		}
+		s.workerMu.RUnlock()
+
+		if len(healthyURLs) == 0 {
+			healthyURLs = activeURLs
+		}
+
+		idx := int(atomic.AddInt64(&runner.activeConns, 1)) % len(healthyURLs)
+		if idx < 0 {
+			idx = -idx
+		}
+		chosenURL := healthyURLs[idx]
+		destURL, parseErr := url.Parse(chosenURL)
+		if parseErr != nil {
+			atomic.AddInt64(&runner.activeConns, -1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":{"message":"Invalid worker URL %q: %v","type":"bad_gateway"}}`, chosenURL, parseErr)))
+			return
+		}
+
+		atomic.AddInt64(&s.totalActiveConns, 1)
+		defer atomic.AddInt64(&s.totalActiveConns, -1)
+		defer atomic.AddInt64(&runner.activeConns, -1)
+
+		proxy := &httputil.ReverseProxy{
+			Director: func(r *http.Request) {
+				r.URL.Scheme = destURL.Scheme
+				r.URL.Host = destURL.Host
+				r.Host = destURL.Host
+				if _, ok := r.Header["User-Agent"]; !ok {
+					r.Header.Set("User-Agent", "gpu-vllm-router-supervisor-direct/1.0")
+				}
+			},
+			FlushInterval: 10 * time.Millisecond,
+			ErrorHandler: func(rw http.ResponseWriter, r *http.Request, err error) {
+				log.Printf("[Supervisor:DirectProxy] Forwarding error for model %s to %s: %v", runner.ModelName, chosenURL, err)
+				rw.WriteHeader(http.StatusBadGateway)
+				_, _ = rw.Write([]byte(fmt.Sprintf(`{"error":{"message":"Router direct proxy error for model %s: %v","type":"bad_gateway"}}`, runner.ModelName, err)))
+			},
+		}
+		proxy.ServeHTTP(w, req)
+		return
+	}
 
 	if target == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -1077,6 +1185,13 @@ func (s *Supervisor) watchLoop(ctx context.Context) {
 // performZeroDowntimeReloadForRunner executes blue-green rolling reload for a specific model runner.
 func (s *Supervisor) performZeroDowntimeReloadForRunner(ctx context.Context, runner *ModelRunner, newURLs []string) {
 	runner.mu.Lock()
+	if runner.Mode == "proxy" {
+		runner.ActiveURLs = newURLs
+		runner.AllURLs = newURLs
+		runner.mu.Unlock()
+		log.Printf("[Supervisor] [%s] In proxy mode, updated active workers directly (%d backends)", runner.ModelName, len(newURLs))
+		return
+	}
 	if runner.reloading {
 		runner.mu.Unlock()
 		log.Printf("[Supervisor] Reload already in progress for [%s], skipping duplicate trigger...", runner.ModelName)
@@ -1221,9 +1336,19 @@ func (s *Supervisor) GetTopology(ctx context.Context) (*dashboard.TopologyData, 
 		}
 		runner.mu.RUnlock()
 
+		mode := runner.Mode
+		if mode == "" {
+			mode = "run"
+		}
+		policy := runner.Policy
+		if policy == "" {
+			policy = s.cfg.RouterCfg.Policy
+		}
+
 		modelsTopo = append(modelsTopo, dashboard.ModelTopology{
 			ModelName:    mName,
-			Policy:       string(s.cfg.RouterCfg.Policy),
+			Mode:         string(mode),
+			Policy:       string(policy),
 			WorkerCount:  len(runner.AllURLs),
 			HealthyCount: modelHealthy,
 			ActiveConns:  atomic.LoadInt64(&runner.activeConns),
@@ -1310,5 +1435,210 @@ func (s *Supervisor) ResetBreaker(ctx context.Context, workerURL string) error {
 	}
 	s.workerMu.Unlock()
 	return nil
+}
+
+// GetConfig returns the active configuration snapshot.
+func (s *Supervisor) GetConfig(ctx context.Context) (*dashboard.ConfigSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getConfigLocked(), nil
+}
+
+// UpdateConfig updates runtime configuration parameters and persists to config.yaml if available.
+func (s *Supervisor) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateRequest) (*dashboard.ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.Policy != nil && *req.Policy != "" {
+		p, err := ParsePolicy(*req.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid policy: %w", err)
+		}
+		s.cfg.RouterCfg.Policy = p
+	}
+	if req.ZeroDowntime != nil {
+		s.cfg.ZeroDowntime = *req.ZeroDowntime
+	}
+	if req.DrainTimeoutSecs != nil && *req.DrainTimeoutSecs > 0 {
+		s.cfg.DrainTimeout = time.Duration(*req.DrainTimeoutSecs) * time.Second
+	}
+	if req.WatchIntervalSecs != nil && *req.WatchIntervalSecs > 0 {
+		s.cfg.WatchInterval = time.Duration(*req.WatchIntervalSecs) * time.Second
+	}
+	if req.MaxFailures != nil && *req.MaxFailures > 0 {
+		s.cfg.WorkerMaxFailures = *req.MaxFailures
+	}
+	if req.HealthCheckIntervalSecs != nil && *req.HealthCheckIntervalSecs > 0 {
+		s.cfg.WorkerProbeInterval = time.Duration(*req.HealthCheckIntervalSecs) * time.Second
+	}
+
+	if req.Models != nil {
+		for _, m := range req.Models {
+			rule := config.ModelRule{
+				ModelName: m.ModelName,
+				Mode:      m.Mode,
+				Policy:    m.Policy,
+			}
+			s.modelRules[m.ModelName] = rule
+			s.applyModelRuleLocked(ctx, rule)
+		}
+	}
+
+	_ = s.saveConfigToFileLocked()
+	return s.getConfigLocked(), nil
+}
+
+// UpdateModelRule updates rule for a single model and hot-applies immediately.
+func (s *Supervisor) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpdateRequest) (*dashboard.ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rule := config.ModelRule{
+		ModelName: req.ModelName,
+		Mode:      req.Mode,
+		Policy:    req.Policy,
+	}
+	s.modelRules[req.ModelName] = rule
+	s.applyModelRuleLocked(ctx, rule)
+
+	_ = s.saveConfigToFileLocked()
+	return s.getConfigLocked(), nil
+}
+
+func (s *Supervisor) applyModelRuleLocked(ctx context.Context, rule config.ModelRule) {
+	runner, ok := s.runners[rule.ModelName]
+	if !ok || runner == nil {
+		return
+	}
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+
+	targetMode := rule.Mode
+	if targetMode == "" {
+		targetMode = "run"
+	}
+	targetPolicy := Policy(rule.Policy)
+	if targetPolicy == "" {
+		targetPolicy = s.cfg.RouterCfg.Policy
+	}
+
+	prevMode := runner.Mode
+	runner.Mode = targetMode
+	runner.Policy = targetPolicy
+
+	// Transition from run -> proxy: Kill child process if exists
+	if targetMode == "proxy" && prevMode == "run" {
+		if runner.CurrentProc != nil && runner.CurrentProc.cmd != nil && runner.CurrentProc.cmd.Process != nil {
+			log.Printf("[Supervisor] Switching [%s] to proxy mode. Terminating child router process...", runner.ModelName)
+			_ = runner.CurrentProc.cmd.Process.Kill()
+			runner.CurrentProc = nil
+			runner.ActiveTarget = nil
+		}
+	}
+
+	// Transition from proxy -> run: Spawn child process if backends available
+	if targetMode == "run" && prevMode != "run" && len(runner.AllURLs) > 0 {
+		log.Printf("[Supervisor] Switching [%s] to run mode. Spawning dedicated router process...", runner.ModelName)
+		go func(mName string, urls []string) {
+			r, err := s.startModelRunner(context.Background(), mName, urls)
+			if err != nil {
+				log.Printf("[Supervisor] Error starting runner for [%s] in run mode: %v", mName, err)
+				return
+			}
+			runner.mu.Lock()
+			runner.CurrentProc = r.CurrentProc
+			runner.ActiveTarget = r.ActiveTarget
+			runner.mu.Unlock()
+		}(runner.ModelName, append([]string(nil), runner.AllURLs...))
+	}
+}
+
+func (s *Supervisor) saveConfigToFileLocked() error {
+	if s.configFilePath == "" {
+		s.configFilePath = "config.yaml"
+	}
+
+	cfgToSave := &config.FileConfig{
+		Router: config.RouterConfig{
+			Mode:          "run",
+			Host:          s.cfg.PublicHost,
+			Port:          s.cfg.PublicPort,
+			WatchInterval: s.cfg.WatchInterval,
+			ZeroDowntime:  &s.cfg.ZeroDowntime,
+			DrainTimeout:  s.cfg.DrainTimeout,
+		},
+		Target: config.TargetConfig{
+			ModelName: s.modelName,
+			Policy:    string(s.cfg.RouterCfg.Policy),
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			MaxFailures:         s.cfg.WorkerMaxFailures,
+			HealthCheckInterval: s.cfg.WorkerProbeInterval,
+		},
+	}
+
+	for _, r := range s.modelRules {
+		cfgToSave.Models = append(cfgToSave.Models, r)
+	}
+
+	return config.SaveConfig(s.configFilePath, cfgToSave)
+}
+
+func (s *Supervisor) getConfigLocked() *dashboard.ConfigSnapshot {
+	var models []dashboard.ModelRuleDTO
+	for mName, r := range s.modelRules {
+		models = append(models, dashboard.ModelRuleDTO{
+			ModelName: mName,
+			Mode:      r.Mode,
+			Policy:    r.Policy,
+		})
+	}
+	existing := make(map[string]bool)
+	for _, m := range models {
+		existing[m.ModelName] = true
+	}
+	for mName, runner := range s.runners {
+		if !existing[mName] {
+			runner.mu.RLock()
+			mode := runner.Mode
+			if mode == "" {
+				mode = "run"
+			}
+			policy := runner.Policy
+			if policy == "" {
+				policy = s.cfg.RouterCfg.Policy
+			}
+			runner.mu.RUnlock()
+
+			models = append(models, dashboard.ModelRuleDTO{
+				ModelName: mName,
+				Mode:      string(mode),
+				Policy:    string(policy),
+			})
+			existing[mName] = true
+		}
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ModelName < models[j].ModelName
+	})
+
+	return &dashboard.ConfigSnapshot{
+		Mode:                    "run",
+		Policy:                  string(s.cfg.RouterCfg.Policy),
+		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
+		ZeroDowntime:            s.cfg.ZeroDowntime,
+		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
+		CircuitBreakerEnabled:   true,
+		MaxFailures:             s.cfg.WorkerMaxFailures,
+		CooldownSecs:            10,
+		MaxRetries:              2,
+		HealthCheckIntervalSecs: int(s.cfg.WorkerProbeInterval.Seconds()),
+		SuccessThreshold:        2,
+		Models:                  models,
+		AvailablePolicies:       []string{"consistent_hash", "round_robin", "power_of_two", "random"},
+		AvailableModes:          []string{"proxy", "run"},
+		ConfigFilePath:          s.configFilePath,
+	}
 }
 

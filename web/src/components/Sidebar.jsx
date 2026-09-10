@@ -13,6 +13,7 @@ export default function Sidebar({
   const navItems = [
     { id: 'topology', label: '架构拓扑', icon: '🌐' },
     { id: 'workers', label: '节点负载', icon: '📊' },
+    { id: 'rules', label: '规则与参数', icon: '⚙️' },
     { id: 'playground', label: '推理测试', icon: '💬' },
     { id: 'metrics', label: '监控指标', icon: '📈' },
   ];

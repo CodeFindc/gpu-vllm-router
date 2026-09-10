@@ -63,3 +63,54 @@ router:
 		t.Errorf("expected drain_timeout 45s, got %v", cfg.Router.DrainTimeout)
 	}
 }
+
+func TestSaveAndLoadConfigWithModels(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgFile := filepath.Join(tmpDir, "config.yaml")
+
+	zeroDown := true
+	cfg := &FileConfig{
+		GPUStack: GPUStackConfig{
+			BaseURL: "http://127.0.0.1:8200",
+		},
+		Target: TargetConfig{
+			Policy: "consistent_hash",
+		},
+		Router: RouterConfig{
+			Mode:         "proxy",
+			Host:         "0.0.0.0",
+			Port:         8000,
+			ZeroDowntime: &zeroDown,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			MaxFailures: 3,
+			Cooldown:    10 * time.Second,
+		},
+		Models: []ModelRule{
+			{ModelName: "DeepSeek-V4", Mode: "proxy", Policy: "consistent_hash"},
+			{ModelName: "Qwen3.6-27B", Mode: "run", Policy: "power_of_two"},
+		},
+	}
+
+	if err := SaveConfig(cfgFile, cfg); err != nil {
+		t.Fatalf("SaveConfig failed: %v", err)
+	}
+
+	loaded, err := LoadConfig(cfgFile)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+
+	if loaded.Router.Mode != "proxy" {
+		t.Errorf("expected router.mode proxy, got %s", loaded.Router.Mode)
+	}
+	if len(loaded.Models) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(loaded.Models))
+	}
+	if loaded.Models[0].ModelName != "DeepSeek-V4" || loaded.Models[0].Mode != "proxy" {
+		t.Errorf("unexpected model 0: %+v", loaded.Models[0])
+	}
+	if loaded.Models[1].ModelName != "Qwen3.6-27B" || loaded.Models[1].Mode != "run" {
+		t.Errorf("unexpected model 1: %+v", loaded.Models[1])
+	}
+}

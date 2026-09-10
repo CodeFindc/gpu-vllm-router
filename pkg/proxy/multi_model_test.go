@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"testing"
 
+	"gpu-vllm-router/pkg/config"
+	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/router"
 )
@@ -171,6 +174,88 @@ func TestProxyEndpointsAndTopology(t *testing.T) {
 	_, resetErr := cb.GetLastProbeAndError()
 	if resetErr != "" {
 		t.Errorf("expected lastErr to be cleared after reset, got %s", resetErr)
+	}
+}
+
+func TestProxyConfigManager(t *testing.T) {
+	tempDir := t.TempDir()
+	cfgPath := filepath.Join(tempDir, "config.yaml")
+
+	srv := NewServer(ServerConfig{
+		Host:           "127.0.0.1",
+		Port:           8080,
+		Policy:         router.PolicyConsistentHash,
+		ConfigFilePath: cfgPath,
+	}, nil)
+
+	u, _ := url.Parse("http://worker-1:8000")
+	target := &BackendTarget{
+		URL:       u,
+		URLString: "http://worker-1:8000",
+		Healthy:   true,
+	}
+	srv.modelPools["deepseek"] = &ModelPool{
+		ModelName: "deepseek",
+		Mode:      "proxy",
+		Policy:    router.PolicyConsistentHash,
+		Balancer:  NewBalancer(router.PolicyConsistentHash, []*BackendTarget{target}),
+		Targets:   []*BackendTarget{target},
+	}
+
+	ctx := context.Background()
+
+	// 1. GetConfig
+	cfg, err := srv.GetConfig(ctx)
+	if err != nil {
+		t.Fatalf("GetConfig failed: %v", err)
+	}
+	if cfg.Mode != "proxy" || cfg.Policy != "consistent_hash" {
+		t.Errorf("unexpected initial config: %+v", cfg)
+	}
+	if len(cfg.Models) != 1 || cfg.Models[0].ModelName != "deepseek" {
+		t.Errorf("expected model deepseek, got %+v", cfg.Models)
+	}
+
+	// 2. UpdateModelRule
+	updated, err := srv.UpdateModelRule(ctx, dashboard.ModelRuleUpdateRequest{
+		ModelName: "deepseek",
+		Mode:      "proxy",
+		Policy:    "round_robin",
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelRule failed: %v", err)
+	}
+	if len(updated.Models) != 1 || updated.Models[0].Policy != "round_robin" {
+		t.Errorf("expected policy updated to round_robin: %+v", updated.Models)
+	}
+	if srv.modelPools["deepseek"].Policy != "round_robin" {
+		t.Errorf("pool policy not updated in memory: %s", srv.modelPools["deepseek"].Policy)
+	}
+
+	// 3. UpdateConfig (global)
+	newPolicy := "random"
+	newDowntime := true
+	updated2, err := srv.UpdateConfig(ctx, dashboard.ConfigUpdateRequest{
+		Policy:       &newPolicy,
+		ZeroDowntime: &newDowntime,
+	})
+	if err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if updated2.Policy != "random" || updated2.ZeroDowntime != true {
+		t.Errorf("global config update mismatch: %+v", updated2)
+	}
+
+	// 4. Verify disk persistence
+	loaded, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to load saved config: %v", err)
+	}
+	if loaded.Target.Policy != "random" {
+		t.Errorf("saved config policy mismatch: got %s", loaded.Target.Policy)
+	}
+	if len(loaded.Models) != 1 || loaded.Models[0].Policy != "round_robin" {
+		t.Errorf("saved config models mismatch: %+v", loaded.Models)
 	}
 }
 

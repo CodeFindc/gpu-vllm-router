@@ -19,7 +19,9 @@ const (
 
 // CircuitBreakerConfig sets thresholds for a target circuit breaker.
 type CircuitBreakerConfig struct {
+	Enabled             *bool         // If false, circuit breaker is disabled
 	MaxFailures         int           // Consecutive failures to trip (default: 3)
+	SuccessThreshold    int           // Successes in HALF_OPEN to recover (default: 2)
 	Cooldown            time.Duration // Time to remain in OPEN before transitioning to HALF_OPEN (default: 10s)
 	MaxRetries          int           // Number of retries on alternative backends upon failure (default: 2)
 	HealthCheckInterval time.Duration // Interval for probing tripped endpoints (default: 3s)
@@ -27,8 +29,11 @@ type CircuitBreakerConfig struct {
 
 // DefaultCircuitBreakerConfig provides sensible production defaults.
 func DefaultCircuitBreakerConfig() CircuitBreakerConfig {
+	enabled := true
 	return CircuitBreakerConfig{
+		Enabled:             &enabled,
 		MaxFailures:         3,
+		SuccessThreshold:    2,
 		Cooldown:            10 * time.Second,
 		MaxRetries:          2,
 		HealthCheckInterval: 3 * time.Second,

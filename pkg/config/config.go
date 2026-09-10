@@ -48,12 +48,20 @@ type CircuitBreakerConfig struct {
 	HealthCheckTimeout  time.Duration `yaml:"health_check_timeout"`
 }
 
+// ModelRule holds per-model routing override settings.
+type ModelRule struct {
+	ModelName string `yaml:"model_name" json:"model_name"`
+	Mode      string `yaml:"mode,omitempty" json:"mode,omitempty"`     // "proxy" or "run" (empty = inherit global)
+	Policy    string `yaml:"policy,omitempty" json:"policy,omitempty"` // "consistent_hash", etc. (empty = inherit global)
+}
+
 // FileConfig represents the full structure of config.yaml.
 type FileConfig struct {
 	GPUStack       GPUStackConfig       `yaml:"gpustack"`
 	Target         TargetConfig         `yaml:"target"`
 	Router         RouterConfig         `yaml:"router"`
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+	Models         []ModelRule          `yaml:"models,omitempty" json:"models,omitempty"`
 }
 
 // LoadConfig reads and parses a YAML configuration file.
@@ -69,4 +77,28 @@ func LoadConfig(path string) (*FileConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+// SaveConfig safely writes the FileConfig to the specified path.
+func SaveConfig(path string, cfg *FileConfig) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal YAML config: %w", err)
+	}
+
+	tmpPath := fmt.Sprintf("%s.tmp.%d", path, time.Now().UnixNano())
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary config file: %w", err)
+	}
+
+	// Windows-safe rename with remove fallback
+	_ = os.Remove(path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		if writeErr := os.WriteFile(path, data, 0644); writeErr != nil {
+			return fmt.Errorf("failed to save config file %q: %w", path, writeErr)
+		}
+	}
+
+	return nil
 }

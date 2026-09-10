@@ -7,7 +7,7 @@ const POLICY_NAMES = {
   random: '随机分发',
 };
 
-export default function ModelsMatrix({ models, onProbe, onReset, onCopy }) {
+export default function ModelsMatrix({ models, onProbe, onReset, onCopy, onSwitchMode }) {
   if (!models || models.length === 0) {
     return (
       <section className="glass-panel">
@@ -37,17 +37,34 @@ export default function ModelsMatrix({ models, onProbe, onReset, onCopy }) {
       <div className="models-container">
         {models.map((m) => {
           const policyLabel = POLICY_NAMES[m.policy] || m.policy;
+          const isRunMode = m.mode === 'run';
 
           return (
             <div key={m.model_name} className="model-box">
               <div className="model-header">
-                <div className="model-name">
-                  <span>🧠 {m.model_name}</span>
+                <div className="model-name" style={{ flexWrap: 'wrap', gap: '8px' }}>
+                  <span style={{ fontSize: '15px' }}>🧠 {m.model_name}</span>
+                  <span
+                    className={`badge-pill ${isRunMode ? 'pill-purple' : 'pill-blue'}`}
+                    style={{ fontSize: '11px', fontWeight: 600 }}
+                  >
+                    {isRunMode ? '🛡️ 官方守护 (run)' : '⚡ Go 原生代理 (proxy)'}
+                  </span>
                   <span className="badge-pill pill-blue" style={{ fontSize: '11px' }}>
                     策略: {policyLabel}
                   </span>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  {onSwitchMode && (
+                    <button
+                      className="action-btn"
+                      style={{ fontSize: '11px', padding: '3px 8px' }}
+                      onClick={() => onSwitchMode(m.model_name, isRunMode ? 'proxy' : 'run')}
+                      title={`快速将模型切换为 ${isRunMode ? 'proxy (Go 原生代理)' : 'run (官方守护进程)'} 模式`}
+                    >
+                      🔄 快速切换至 {isRunMode ? 'proxy' : 'run'}
+                    </button>
+                  )}
                   <span className="badge-pill pill-green">
                     就绪节点: {m.healthy_count} / {m.worker_count}
                   </span>

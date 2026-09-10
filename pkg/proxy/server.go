@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"gpu-vllm-router/pkg/config"
 	"gpu-vllm-router/pkg/dashboard"
 	"gpu-vllm-router/pkg/gpustack"
 	"gpu-vllm-router/pkg/router"
@@ -31,13 +33,22 @@ type ServerConfig struct {
 	ModelName      string // If empty, operates in full-cluster multi-model mode
 	WatchInterval  time.Duration
 	CircuitBreaker CircuitBreakerConfig
+	ConfigFilePath string
+	ModelRules     []config.ModelRule
+	ZeroDowntime   bool
+	DrainTimeout   time.Duration
 }
 
 // ModelPool manages load balancing and active targets for a specific model.
 type ModelPool struct {
-	ModelName string
-	Balancer  Balancer
-	Targets   []*BackendTarget
+	ModelName    string
+	Mode         string        // "proxy" (default) or "run"
+	Policy       router.Policy // per-model policy
+	Balancer     Balancer
+	Targets      []*BackendTarget
+	RunnerCmd    *exec.Cmd
+	RunnerTarget *url.URL
+	RunnerPort   int
 }
 
 // routeState maintains in-flight routing state across retries and failovers.
@@ -126,16 +137,18 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // Server is the built-in HTTP reverse proxy server with multi-model dynamic load balancing.
 type Server struct {
-	cfg          ServerConfig
-	client       *gpustack.Client
-	mu           sync.RWMutex
-	modelPools   map[string]*ModelPool  // Key: model name
-	modelsList   []gpustack.ModelPublic // All models metadata
-	allTargets   []*BackendTarget
-	activeURLs   []string
-	httpServer   *http.Server
-	reverseProxy *httputil.ReverseProxy
-	stopCh       chan struct{}
+	cfg            ServerConfig
+	client         *gpustack.Client
+	mu             sync.RWMutex
+	modelPools     map[string]*ModelPool  // Key: model name
+	modelsList     []gpustack.ModelPublic // All models metadata
+	allTargets     []*BackendTarget
+	activeURLs     []string
+	configFilePath string
+	modelRules     map[string]config.ModelRule
+	httpServer     *http.Server
+	reverseProxy   *httputil.ReverseProxy
+	stopCh         chan struct{}
 }
 
 // NewServer creates a new reverse proxy Server.
@@ -153,11 +166,18 @@ func NewServer(cfg ServerConfig, client *gpustack.Client) *Server {
 		cfg.CircuitBreaker = DefaultCircuitBreakerConfig()
 	}
 
+	rulesMap := make(map[string]config.ModelRule)
+	for _, r := range cfg.ModelRules {
+		rulesMap[r.ModelName] = r
+	}
+
 	s := &Server{
-		cfg:        cfg,
-		client:     client,
-		modelPools: make(map[string]*ModelPool),
-		stopCh:     make(chan struct{}),
+		cfg:            cfg,
+		client:         client,
+		modelPools:     make(map[string]*ModelPool),
+		stopCh:         make(chan struct{}),
+		configFilePath: cfg.ConfigFilePath,
+		modelRules:     rulesMap,
 	}
 
 	// Custom ReverseProxy with RetryTransport
@@ -264,6 +284,18 @@ func (s *Server) director(req *http.Request) {
 	if err != nil {
 		log.Printf("[Proxy] Model routing error: %v (Request Path: %s)", err, req.URL.Path)
 		ctx := context.WithValue(req.Context(), "route_error", err)
+		*req = *req.WithContext(ctx)
+		return
+	}
+
+	if pool.Mode == "run" && pool.RunnerTarget != nil {
+		req.URL.Scheme = pool.RunnerTarget.Scheme
+		req.URL.Host = pool.RunnerTarget.Host
+		req.Host = pool.RunnerTarget.Host
+		if _, ok := req.Header["User-Agent"]; !ok {
+			req.Header.Set("User-Agent", "gpu-vllm-router-hybrid/1.0")
+		}
+		ctx := context.WithValue(req.Context(), "routed_model", pool.ModelName)
 		*req = *req.WithContext(ctx)
 		return
 	}
@@ -497,9 +529,24 @@ func (s *Server) updateSingleModelEndpoints(modelName string, endpoints []gpusta
 	s.allTargets = targets
 	s.activeURLs = urls
 
+	poolMode := "proxy"
+	poolPolicy := s.cfg.Policy
+	if rule, ok := s.modelRules[modelName]; ok {
+		if rule.Mode != "" {
+			poolMode = rule.Mode
+		}
+		if rule.Policy != "" {
+			if parsedP, err := router.ParsePolicy(rule.Policy); err == nil {
+				poolPolicy = parsedP
+			}
+		}
+	}
+
 	pool := &ModelPool{
 		ModelName: modelName,
-		Balancer:  NewBalancer(s.cfg.Policy, targets),
+		Mode:      poolMode,
+		Policy:    poolPolicy,
+		Balancer:  NewBalancer(poolPolicy, targets),
 		Targets:   targets,
 	}
 	s.modelPools[modelName] = pool
@@ -542,11 +589,35 @@ func (s *Server) updateClusterEndpoints(cluster *gpustack.ClusterEndpoints) {
 			log.Printf("  -> [%s] Worker: %-12s Endpoint: %s", ep.ModelName, ep.WorkerName, ep.URL)
 		}
 
-		newPools[mName] = &ModelPool{
+		poolMode := "proxy"
+		poolPolicy := s.cfg.Policy
+		if rule, ok := s.modelRules[mName]; ok {
+			if rule.Mode != "" {
+				poolMode = rule.Mode
+			}
+			if rule.Policy != "" {
+				if parsedP, err := router.ParsePolicy(rule.Policy); err == nil {
+					poolPolicy = parsedP
+				}
+			}
+		}
+
+		pool := &ModelPool{
 			ModelName: mName,
-			Balancer:  NewBalancer(s.cfg.Policy, targets),
+			Mode:      poolMode,
+			Policy:    poolPolicy,
+			Balancer:  NewBalancer(poolPolicy, targets),
 			Targets:   targets,
 		}
+
+		// Preserve runner if previous pool had one
+		if existingPool, ok := s.modelPools[mName]; ok && existingPool.RunnerCmd != nil {
+			pool.RunnerCmd = existingPool.RunnerCmd
+			pool.RunnerPort = existingPool.RunnerPort
+			pool.RunnerTarget = existingPool.RunnerTarget
+		}
+
+		newPools[mName] = pool
 
 		if mInfo, ok := cluster.Models[mName]; ok {
 			modelsList = append(modelsList, mInfo)
@@ -901,9 +972,19 @@ func (s *Server) GetTopology(ctx context.Context) (*dashboard.TopologyData, erro
 			})
 		}
 
+		mode := pool.Mode
+		if mode == "" {
+			mode = "proxy"
+		}
+		policy := pool.Policy
+		if policy == "" {
+			policy = s.cfg.Policy
+		}
+
 		modelsTopo = append(modelsTopo, dashboard.ModelTopology{
 			ModelName:    mName,
-			Policy:       string(s.cfg.Policy),
+			Mode:         string(mode),
+			Policy:       string(policy),
 			WorkerCount:  len(pool.Targets),
 			HealthyCount: modelHealthy,
 			ActiveConns:  modelConns,
@@ -985,6 +1066,265 @@ func (s *Server) ResetBreaker(ctx context.Context, workerURL string) error {
 		foundTarget.CircuitBreaker.Reset()
 	}
 	return nil
+}
+
+// GetConfig returns the active configuration snapshot.
+func (s *Server) GetConfig(ctx context.Context) (*dashboard.ConfigSnapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getConfigLocked(), nil
+}
+
+// UpdateConfig updates runtime configuration parameters and persists to config.yaml if available.
+func (s *Server) UpdateConfig(ctx context.Context, req dashboard.ConfigUpdateRequest) (*dashboard.ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.Policy != nil && *req.Policy != "" {
+		p, err := router.ParsePolicy(*req.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid policy: %w", err)
+		}
+		s.cfg.Policy = p
+		for _, pool := range s.modelPools {
+			if pool.Policy == "" {
+				pool.Balancer = NewBalancer(p, pool.Targets)
+			}
+		}
+	}
+	if req.ZeroDowntime != nil {
+		s.cfg.ZeroDowntime = *req.ZeroDowntime
+	}
+	if req.DrainTimeoutSecs != nil && *req.DrainTimeoutSecs > 0 {
+		s.cfg.DrainTimeout = time.Duration(*req.DrainTimeoutSecs) * time.Second
+	}
+	if req.WatchIntervalSecs != nil && *req.WatchIntervalSecs > 0 {
+		s.cfg.WatchInterval = time.Duration(*req.WatchIntervalSecs) * time.Second
+	}
+	if req.CircuitBreakerEnabled != nil {
+		s.cfg.CircuitBreaker.Enabled = req.CircuitBreakerEnabled
+	}
+	if req.MaxFailures != nil && *req.MaxFailures > 0 {
+		s.cfg.CircuitBreaker.MaxFailures = *req.MaxFailures
+	}
+	if req.CooldownSecs != nil && *req.CooldownSecs > 0 {
+		s.cfg.CircuitBreaker.Cooldown = time.Duration(*req.CooldownSecs) * time.Second
+	}
+	if req.MaxRetries != nil && *req.MaxRetries >= 0 {
+		s.cfg.CircuitBreaker.MaxRetries = *req.MaxRetries
+	}
+	if req.HealthCheckIntervalSecs != nil && *req.HealthCheckIntervalSecs > 0 {
+		s.cfg.CircuitBreaker.HealthCheckInterval = time.Duration(*req.HealthCheckIntervalSecs) * time.Second
+	}
+	if req.SuccessThreshold != nil && *req.SuccessThreshold > 0 {
+		s.cfg.CircuitBreaker.SuccessThreshold = *req.SuccessThreshold
+	}
+
+	if req.Models != nil {
+		for _, m := range req.Models {
+			rule := config.ModelRule{
+				ModelName: m.ModelName,
+				Mode:      m.Mode,
+				Policy:    m.Policy,
+			}
+			s.modelRules[m.ModelName] = rule
+			s.applyModelRuleLocked(ctx, rule)
+		}
+	}
+
+	_ = s.saveConfigToFileLocked()
+	return s.getConfigLocked(), nil
+}
+
+// UpdateModelRule updates rule for a single model and hot-applies immediately.
+func (s *Server) UpdateModelRule(ctx context.Context, req dashboard.ModelRuleUpdateRequest) (*dashboard.ConfigSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rule := config.ModelRule{
+		ModelName: req.ModelName,
+		Mode:      req.Mode,
+		Policy:    req.Policy,
+	}
+	s.modelRules[req.ModelName] = rule
+	s.applyModelRuleLocked(ctx, rule)
+
+	_ = s.saveConfigToFileLocked()
+	return s.getConfigLocked(), nil
+}
+
+func (s *Server) applyModelRuleLocked(ctx context.Context, rule config.ModelRule) {
+	pool, ok := s.modelPools[rule.ModelName]
+	if !ok || pool == nil {
+		return
+	}
+
+	targetMode := rule.Mode
+	if targetMode == "" {
+		targetMode = "proxy"
+	}
+	prevMode := pool.Mode
+	pool.Mode = targetMode
+
+	if rule.Policy != "" {
+		if p, err := router.ParsePolicy(rule.Policy); err == nil {
+			pool.Policy = p
+			pool.Balancer = NewBalancer(p, pool.Targets)
+		}
+	} else {
+		pool.Policy = s.cfg.Policy
+		pool.Balancer = NewBalancer(s.cfg.Policy, pool.Targets)
+	}
+
+	// Mode run: spawn runner if needed
+	if targetMode == "run" && prevMode != "run" && len(pool.Targets) > 0 {
+		var urls []string
+		for _, t := range pool.Targets {
+			urls = append(urls, t.URLString)
+		}
+		log.Printf("[Proxy] Model [%s] switched to run mode. Spawning vllm-router runner...", pool.ModelName)
+		go func(p *ModelPool, u []string) {
+			_ = s.startRunnerForPool(p, u)
+		}(pool, urls)
+	}
+
+	// Mode proxy: terminate runner if exists
+	if targetMode == "proxy" && prevMode == "run" {
+		if pool.RunnerCmd != nil && pool.RunnerCmd.Process != nil {
+			log.Printf("[Proxy] Model [%s] switched to proxy mode. Stopping child runner...", pool.ModelName)
+			_ = pool.RunnerCmd.Process.Kill()
+			pool.RunnerCmd = nil
+			pool.RunnerTarget = nil
+		}
+	}
+}
+
+func (s *Server) startRunnerForPool(pool *ModelPool, urls []string) error {
+	freePort, err := router.GetFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to get free port: %w", err)
+	}
+	cfg := router.Config{
+		RouterBin:  "vllm-router",
+		Host:       "127.0.0.1",
+		Port:       freePort,
+		Policy:     pool.Policy,
+		WorkerURLs: urls,
+		Backend:    "vllm",
+		LogLevel:   "info",
+	}
+	args := router.BuildArgs(cfg)
+	cmd := exec.Command("vllm-router", args...)
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Proxy] Failed to start vllm-router for [%s]: %v", pool.ModelName, err)
+		return err
+	}
+	s.mu.Lock()
+	pool.RunnerCmd = cmd
+	pool.RunnerPort = freePort
+	pool.RunnerTarget, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", freePort))
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) saveConfigToFileLocked() error {
+	if s.configFilePath == "" {
+		s.configFilePath = "config.yaml"
+	}
+
+	cbEnabled := true
+	if s.cfg.CircuitBreaker.Enabled != nil {
+		cbEnabled = *s.cfg.CircuitBreaker.Enabled
+	}
+
+	cfgToSave := &config.FileConfig{
+		Router: config.RouterConfig{
+			Mode:          "proxy",
+			Host:          s.cfg.Host,
+			Port:          s.cfg.Port,
+			WatchInterval: s.cfg.WatchInterval,
+			ZeroDowntime:  &s.cfg.ZeroDowntime,
+			DrainTimeout:  s.cfg.DrainTimeout,
+		},
+		Target: config.TargetConfig{
+			ModelName: s.cfg.ModelName,
+			Policy:    string(s.cfg.Policy),
+		},
+		CircuitBreaker: config.CircuitBreakerConfig{
+			Enabled:             &cbEnabled,
+			MaxFailures:         s.cfg.CircuitBreaker.MaxFailures,
+			SuccessThreshold:    s.cfg.CircuitBreaker.SuccessThreshold,
+			Cooldown:            s.cfg.CircuitBreaker.Cooldown,
+			WindowDuration:      10 * time.Second,
+			MaxRetries:          s.cfg.CircuitBreaker.MaxRetries,
+			HealthCheckInterval: s.cfg.CircuitBreaker.HealthCheckInterval,
+		},
+	}
+
+	for _, r := range s.modelRules {
+		cfgToSave.Models = append(cfgToSave.Models, r)
+	}
+
+	return config.SaveConfig(s.configFilePath, cfgToSave)
+}
+
+func (s *Server) getConfigLocked() *dashboard.ConfigSnapshot {
+	var models []dashboard.ModelRuleDTO
+	for mName, r := range s.modelRules {
+		models = append(models, dashboard.ModelRuleDTO{
+			ModelName: mName,
+			Mode:      r.Mode,
+			Policy:    r.Policy,
+		})
+	}
+	existing := make(map[string]bool)
+	for _, m := range models {
+		existing[m.ModelName] = true
+	}
+	for mName, pool := range s.modelPools {
+		if !existing[mName] {
+			mode := pool.Mode
+			if mode == "" {
+				mode = "proxy"
+			}
+			policy := pool.Policy
+			if policy == "" {
+				policy = s.cfg.Policy
+			}
+			models = append(models, dashboard.ModelRuleDTO{
+				ModelName: mName,
+				Mode:      string(mode),
+				Policy:    string(policy),
+			})
+			existing[mName] = true
+		}
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ModelName < models[j].ModelName
+	})
+
+	cbEnabled := true
+	if s.cfg.CircuitBreaker.Enabled != nil {
+		cbEnabled = *s.cfg.CircuitBreaker.Enabled
+	}
+
+	return &dashboard.ConfigSnapshot{
+		Mode:                    "proxy",
+		Policy:                  string(s.cfg.Policy),
+		WatchIntervalSecs:       int(s.cfg.WatchInterval.Seconds()),
+		ZeroDowntime:            s.cfg.ZeroDowntime,
+		DrainTimeoutSecs:        int(s.cfg.DrainTimeout.Seconds()),
+		CircuitBreakerEnabled:   cbEnabled,
+		MaxFailures:             s.cfg.CircuitBreaker.MaxFailures,
+		CooldownSecs:            int(s.cfg.CircuitBreaker.Cooldown.Seconds()),
+		MaxRetries:              s.cfg.CircuitBreaker.MaxRetries,
+		HealthCheckIntervalSecs: int(s.cfg.CircuitBreaker.HealthCheckInterval.Seconds()),
+		SuccessThreshold:        s.cfg.CircuitBreaker.SuccessThreshold,
+		Models:                  models,
+		AvailablePolicies:       []string{"consistent_hash", "round_robin", "power_of_two", "random"},
+		AvailableModes:          []string{"proxy", "run"},
+		ConfigFilePath:          s.configFilePath,
+	}
 }
 
 

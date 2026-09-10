@@ -322,13 +322,24 @@ func main() {
 
 	case "run":
 		log.Printf("正在以守护进程模式启动官方 vllm-router (%s)...", *routerBin)
+		resolvedConfigPath := actualConfigPath
+		if resolvedConfigPath == "" {
+			resolvedConfigPath = "config.yaml"
+		}
+		var modelRules []config.ModelRule
+		if fileCfg != nil {
+			modelRules = fileCfg.Models
+		}
+
 		supCfg := router.SupervisorConfig{
-			ZeroDowntime:  *zeroDowntime,
-			PublicHost:    *host,
-			PublicPort:    *port,
-			DrainTimeout:  *drainTimeout,
-			WatchInterval: *watchInterval,
-			RouterCfg:     routerCfg,
+			ZeroDowntime:   *zeroDowntime,
+			PublicHost:     *host,
+			PublicPort:     *port,
+			DrainTimeout:   *drainTimeout,
+			WatchInterval:  *watchInterval,
+			RouterCfg:      routerCfg,
+			ConfigFilePath: resolvedConfigPath,
+			ModelRules:     modelRules,
 		}
 		if fileCfg != nil {
 			if fileCfg.CircuitBreaker.HealthCheckInterval > 0 {
@@ -348,6 +359,15 @@ func main() {
 
 	case "proxy":
 		log.Printf("正在启动内置 Go 语言高性能 OpenAI 兼容反向代理网关...")
+		resolvedConfigPath := actualConfigPath
+		if resolvedConfigPath == "" {
+			resolvedConfigPath = "config.yaml"
+		}
+		var modelRules []config.ModelRule
+		if fileCfg != nil {
+			modelRules = fileCfg.Models
+		}
+
 		cbCfg := proxy.DefaultCircuitBreakerConfig()
 		if fileCfg != nil {
 			if fileCfg.CircuitBreaker.MaxFailures > 0 {
@@ -371,6 +391,10 @@ func main() {
 			ModelName:      *modelName,
 			WatchInterval:  *watchInterval,
 			CircuitBreaker: cbCfg,
+			ConfigFilePath: resolvedConfigPath,
+			ModelRules:     modelRules,
+			ZeroDowntime:   *zeroDowntime,
+			DrainTimeout:   *drainTimeout,
 		}
 		srv := proxy.NewServer(proxyCfg, client)
 

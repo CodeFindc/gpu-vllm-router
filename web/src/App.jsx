@@ -4,6 +4,7 @@ import HeaderBar from './components/HeaderBar';
 import KpiGrid from './components/KpiGrid';
 import TopologyFlow from './components/TopologyFlow';
 import ModelsMatrix from './components/ModelsMatrix';
+import ConfigRulesView from './components/ConfigRulesView';
 import PlaygroundView from './components/PlaygroundView';
 import MetricsView from './components/MetricsView';
 
@@ -77,6 +78,27 @@ export default function App() {
     }
   };
 
+  const handleQuickSwitchMode = async (modelName, targetMode) => {
+    try {
+      const resp = await fetch('/api/models/rule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model_name: modelName,
+          mode: targetMode,
+        }),
+      });
+      const res = await resp.json();
+      if (!resp.ok || !res.success) {
+        throw new Error(res.message || '切换失败');
+      }
+      showToast(`🔄 模型 ${modelName} 模式已切换为 ${targetMode}`);
+      fetchTopology();
+    } catch (err) {
+      showToast(`❌ 模式切换失败: ${err.message}`, true);
+    }
+  };
+
   const handleCopy = (text) => {
     navigator.clipboard.writeText(text).then(() => {
       showToast(`📋 内容已复制到剪贴板`);
@@ -126,6 +148,7 @@ export default function App() {
                 onProbe={handleProbe}
                 onReset={handleReset}
                 onCopy={handleCopy}
+                onSwitchMode={handleQuickSwitchMode}
               />
             </>
           )}
@@ -137,10 +160,20 @@ export default function App() {
               onProbe={handleProbe}
               onReset={handleReset}
               onCopy={handleCopy}
+              onSwitchMode={handleQuickSwitchMode}
             />
           )}
 
-          {/* Tab 3: Interactive Inference Playground */}
+          {/* Tab 3: Rules and Mode Configuration */}
+          {activeTab === 'rules' && (
+            <ConfigRulesView
+              onRefreshTopology={fetchTopology}
+              showToast={showToast}
+              onCopy={handleCopy}
+            />
+          )}
+
+          {/* Tab 4: Interactive Inference Playground */}
           {activeTab === 'playground' && (
             <PlaygroundView
               models={data?.models || []}
@@ -148,7 +181,7 @@ export default function App() {
             />
           )}
 
-          {/* Tab 4: System Metrics & Raw JSON */}
+          {/* Tab 5: System Metrics & Raw JSON */}
           {activeTab === 'metrics' && (
             <MetricsView
               data={data}
